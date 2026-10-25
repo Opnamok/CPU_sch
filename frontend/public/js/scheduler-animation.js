@@ -27,7 +27,7 @@ class SchedulerAnimation {
         const maxTime = Math.max(...this.gantt.map(seg => seg.end));
         
         const html = `
-            <div class="animation-container" style="background: var(--bg-secondary); padding: 1.5rem; border-radius: 8px; border: 1px solid var(--border); overflow: hidden;">
+            <div class="animation-container" style="background: var(--bg-secondary); padding: 1.5rem; border-radius: 0; border: 1px solid var(--border); overflow: hidden;">
                 <!-- Controls -->
                 <div class="animation-controls" style="display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border);">
                     <button id="play-btn-${this.container.id}" class="btn btn-primary" style="padding: 0.5rem 1rem; flex-shrink: 0;">
@@ -60,7 +60,7 @@ class SchedulerAnimation {
                             Step: <span id="current-step-${this.container.id}" style="font-weight: 600; color: var(--primary);">0</span> / ${this.gantt.length}
                         </span>
                     </div>
-                    <div style="background: var(--bg-tertiary); height: 8px; border-radius: 4px; overflow: hidden;">
+                    <div style="background: var(--bg-tertiary); height: 8px; border-radius: 0; overflow: hidden;">
                         <div id="progress-bar-${this.container.id}" style="height: 100%; background: var(--primary); width: 0%; transition: width 0.3s;"></div>
                     </div>
                 </div>
@@ -87,7 +87,7 @@ class SchedulerAnimation {
                 </div>
                 
                 <!-- Current Execution Info -->
-                <div id="execution-info-${this.container.id}" style="margin-top: 1rem; padding: 1rem; background: var(--bg-tertiary); border-radius: 4px; border-left: 3px solid var(--primary);">
+                <div id="execution-info-${this.container.id}" style="margin-top: 1rem; padding: 1rem; background: var(--bg-tertiary); border-radius: 0; border-left: 3px solid var(--primary);">
                     <div style="font-weight: 600; margin-bottom: 0.5rem; color: var(--text-primary);">Current Execution:</div>
                     <div id="execution-text-${this.container.id}" style="font-size: 0.9rem; color: var(--text-secondary);">
                         Ready to start animation
@@ -191,28 +191,32 @@ class SchedulerAnimation {
         const maxTime = Math.max(...this.gantt.map(seg => seg.end));
         const visibleGantt = this.gantt.slice(0, this.currentStep);
         
-        let html = '<div style="position: relative; height: 60px; background: var(--bg-tertiary); border-radius: 4px; overflow: hidden;">';
+        let html = '<div style="position: relative; height: 60px; background: var(--bg-tertiary); border-radius: 0; overflow: hidden;">';
         
         visibleGantt.forEach(segment => {
             const duration = segment.end - segment.start;
             const left = (segment.start / maxTime) * 100;
             const width = (duration / maxTime) * 100;
             
-            let color = '#64748b';
-            if (segment.pid && segment.pid !== 'IDLE') {
-                const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4'];
-                color = colors[segment.pid % colors.length];
-            }
+            // segment.pid is null on idle gaps, which is exactly the
+            // distinction this needs. Before the engine stamped pid onto
+            // segments, every block here fell through to grey and "P?".
+            const isIdle = !segment.pid || segment.pid === 'IDLE';
+            const color = isIdle
+                ? 'transparent'
+                : Theme.processColor('P' + segment.pid);
+            const state = segment.freq_state || '';
             
             const isCurrentSegment = visibleGantt.length > 0 && segment === visibleGantt[visibleGantt.length - 1];
             const animation = isCurrentSegment ? 'animation: pulse 1s infinite;' : '';
             
             html += `
-                <div style="position: absolute; left: ${left}%; width: ${width}%; height: 100%; background: ${color}; 
-                            display: flex; flex-direction: column; justify-content: center; align-items: center; 
-                            color: white; font-size: 0.85rem; border-right: 1px solid rgba(255,255,255,0.2); ${animation}">
-                    <div style="font-weight: 600;">P${segment.pid || '?'}</div>
-                    <div style="font-size: 0.75rem; opacity: 0.8;">${segment.start}-${segment.end}</div>
+                <div class="gantt-segment${isIdle ? ' idle' : ''}"
+                     title="${isIdle ? 'idle' : 'P' + segment.pid}: ${segment.start}-${segment.end}${state ? ' at ' + state : ''}"
+                     style="position: absolute; left: ${left}%; width: ${width}%; height: 100%;
+                            background: ${color}; ${animation}">
+                    <div style="font-weight: 600;">${isIdle ? '~' : 'P' + segment.pid}</div>
+                    <div style="font-size: 0.68rem; opacity: 0.8;">${state || (segment.start + '-' + segment.end)}</div>
                 </div>
             `;
         });

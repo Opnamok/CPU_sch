@@ -143,17 +143,24 @@ FUNCTION EnergyAwareHybrid(processes, threshold):
 
 ### Power States
 
-| State | Frequency | Power Formula | Typical Power |
-|-------|-----------|---------------|---------------|
-| **HIGH** | 1.0 | 5.0 × freq | 5.0 W |
-| **MED** | 0.7 | 3.0 × freq | 2.1 W |
-| **LOW** | 0.4 | 1.5 × freq | 0.6 W |
-| **IDLE** | 0.0 | constant | 0.2 W |
+| State | Frequency | Voltage | Power | Time per work unit | Energy per work unit |
+|-------|-----------|---------|-------|--------------------|----------------------|
+| **HIGH** | 3.0 GHz | 1.00 V | 5.000 W | 1.0x | 5.0000 |
+| **MED** | 2.0 GHz | 0.85 V | 2.901 W | 1.5x | **4.3511** |
+| **LOW** | 1.2 GHz | 0.75 V | 1.861 W | 2.5x | 4.6531 |
+| **IDLE** | clock-gated | - | 0.200 W | - | - |
+
+Power is derived, not asserted: `P = c_eff * f_GHz * V^2 + p_static` with
+`c_eff = 1.35` and `p_static = 0.95`. Note that **MED is the energy-optimal
+state** -- LOW is both slower and less efficient, because leakage is paid for
+longer. See [ENERGY_CALCULATION.md](ENERGY_CALCULATION.md).
 
 ### Energy Calculation
 
 ```
-Total Energy = Σ(Power_state × Duration) + (Context_Switches × Penalty)
+Total Energy = Σ(Power_state × Duration)
+             + (Context_Switches  × 0.5)
+             + (Frequency_Changes × 0.1)
 
 Where:
 - Power_state: Current CPU power level (HIGH/MED/LOW/IDLE)
@@ -500,7 +507,11 @@ curl -X POST http://localhost:8001/api/all \
 
 ## 👥 Contributors
 
-- **Names**: Gaurav Rajhbhar and Sarthak Pandey
+- Zanzan Hrushaibh Shrikrishna (24BCE0485)
+- Aryaman Bajaj (24BCE0444)
+
+Course: Operating Systems. School of Computer Science and Engineering (SCOPE),
+Vellore Institute of Technology, Vellore.
 - **Roll Numbers**: 64 and 66
 - **Course**: Operating Systems
 - **Academic Year**: 2025

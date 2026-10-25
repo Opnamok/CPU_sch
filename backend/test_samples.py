@@ -1,10 +1,25 @@
 """
-Test all sample workloads to see which algorithms win
-"""
-import requests
-import json
+Benchmark every sample workload against a running server.
 
-API_URL = "http://localhost:8000/api/compare"
+Prints, per workload, each algorithm's metrics plus the Pareto frontier -- the
+set of policies that nothing else beats on both energy and turnaround at once.
+That is a more honest summary than a single weighted winner, which hides the
+weighting inside itself.
+
+Usage:
+    uvicorn server:app --port 8000      # in another terminal
+    python test_samples.py [--url http://localhost:8000] [--csv out.csv]
+
+Uses only the standard library, and prints plain ASCII so it works in a
+Windows console (cp1252 cannot encode emoji).
+"""
+
+import argparse
+import csv
+import json
+import sys
+import urllib.error
+import urllib.request
 
 samples = {
     "fcfs1": {
@@ -99,74 +114,129 @@ samples = {
     }
 }
 
-def analyze_results(results):
-    """Find which algorithm has best overall score"""
-    algos = {}
-    
-    for algo_key, data in results.items():
-        if "error" in data:
-            continue
-        
-        algo_name = data.get("algorithm", algo_key)
-        algos[algo_name] = {
-            "completion": float(data["completion_time"]),
-            "turnaround": float(data["avg_turnaround"]),
-            "waiting": float(data["avg_waiting"]),
-            "energy": float(data["total_energy"]),
-            "switches": int(data["context_switches"])
-        }
-    
-    # Find best for each metric
-    best_metrics = {
-        "completion": min(algos.items(), key=lambda x: x[1]["completion"]),
-        "turnaround": min(algos.items(), key=lambda x: x[1]["turnaround"]),
-        "waiting": min(algos.items(), key=lambda x: x[1]["waiting"]),
-        "energy": min(algos.items(), key=lambda x: x[1]["energy"]),
-        "switches": min(algos.items(), key=lambda x: x[1]["switches"])
-    }
-    
-    # Calculate scores with balanced weights
-    weights = {"completion": 0.20, "turnaround": 0.25, "waiting": 0.25, "energy": 0.20, "switches": 0.10}
-    
-    scores = {}
-    for algo_name, metrics in algos.items():
-        normalized = {
-            "completion": metrics["completion"] / (best_metrics["completion"][1]["completion"] or 1),
-            "turnaround": metrics["turnaround"] / (best_metrics["turnaround"][1]["turnaround"] or 1),
-            "waiting": metrics["waiting"] / (best_metrics["waiting"][1]["waiting"] or 1),
-            "energy": metrics["energy"] / (best_metrics["energy"][1]["energy"] or 1),
-            "switches": metrics["switches"] / (best_metrics["switches"][1]["switches"] or 1) if best_metrics["switches"][1]["switches"] > 0 else 1
-        }
-        
-        score = sum(normalized[k] * weights[k] for k in weights.keys())
-        scores[algo_name] = score
-    
-    best_algo = min(scores.items(), key=lambda x: x[1])
-    return best_algo[0], scores
 
-print("=" * 80)
-print("TESTING ALL SAMPLE WORKLOADS")
-print("=" * 80)
 
-for sample_id, sample_data in samples.items():
-    print(f"\n📋 Sample: {sample_id} - {sample_data['name']}")
-    print(f"   Processes: {len(sample_data['processes'])}")
-    
-    try:
-        response = requests.post(API_URL, json={"processes": sample_data["processes"]})
-        
-        if response.status_code == 200:
-            results = response.json()
-            winner, scores = analyze_results(results)
-            
-            print(f"   🏆 WINNER: {winner}")
-            print(f"   📊 Scores:")
-            for algo, score in sorted(scores.items(), key=lambda x: x[1]):
-                print(f"      {algo:40s}: {score:.3f}")
-        else:
-            print(f"   ❌ Error: {response.status_code}")
-    
-    except Exception as e:
-        print(f"   ❌ Exception: {e}")
+ALGOS = ("fcfs", "sjf_non_preemptive", "sjf_preemptive",
+         "round_robin", "priority", "eah")
 
-print("\n" + "=" * 80)
+SHORT = {"fcfs": "FCFS", "sjf_non_preemptive": "SJF", "sjf_preemptive": "SRTF",
+         "round_robin": "RR", "priority": "PRIO", "eah": "EAH"}
+
+
+def compare(base_url, processes, quantum=2, governor=None):
+    payload = {"processes": processes, "quantum": quantum}
+    if governor:
+        payload["governor"] = governor
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/api/compare",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://localhost:8000",
+                        help="base URL of a running server")
+    parser.add_argument("--quantum", type=int, default=2)
+    parser.add_argument("--governor", default=None,
+                        help="frequency governor (default: server's own)")
+    parser.add_argument("--csv", default=None,
+                        help="also write the full metric matrix to this file")
+    args = parser.parse_args()
+
+    print("=" * 78)
+    print("SAMPLE WORKLOAD BENCHMARK")
+    print("=" * 78)
+
+    rows = []
+    frontier_counts = {}
+
+    for sample_id, sample in samples.items():
+        print()
+        print("-" * 78)
+        print("%s  --  %s" % (sample_id, sample["name"]))
+        print("-" * 78)
+
+        try:
+            results = compare(args.url, sample["processes"], args.quantum,
+                              args.governor)
+        except urllib.error.URLError as exc:
+            print("  could not reach %s (%s)" % (args.url, exc.reason))
+            print("  start the server first:  uvicorn server:app --port 8000")
+            return 1
+
+        analysis = results.get("_analysis", {})
+        pareto = analysis.get("pareto", {})
+        frontier = set(pareto.get("pareto_frontier", []))
+
+        print("  %-6s %9s %9s %9s %8s %7s %9s  %s" % (
+            "algo", "complete", "turnarnd", "waiting", "energy", "switch",
+            "EDP", "pareto"))
+        for key in ALGOS:
+            data = results.get(key)
+            if not data or "error" in data:
+                print("  %-6s  error: %s" % (
+                    SHORT.get(key, key), (data or {}).get("error", "missing")))
+                continue
+            mark = "frontier" if key in frontier else ""
+            print("  %-6s %9s %9s %9s %8s %7s %9s  %s" % (
+                SHORT.get(key, key), data["completion_time"],
+                data["avg_turnaround"], data["avg_waiting"],
+                data["total_energy"], data["context_switches"],
+                data["edp"], mark))
+            rows.append({
+                "workload": sample_id,
+                "name": sample["name"],
+                "algorithm": key,
+                "completion": data["completion_time"],
+                "avg_turnaround": data["avg_turnaround"],
+                "avg_waiting": data["avg_waiting"],
+                "total_energy": data["total_energy"],
+                "context_switches": data["context_switches"],
+                "frequency_switches": data.get("frequency_switches"),
+                "edp": data["edp"],
+                "ed2p": data["ed2p"],
+                "on_pareto_frontier": key in frontier,
+            })
+
+        for key in frontier:
+            frontier_counts[key] = frontier_counts.get(key, 0) + 1
+
+        best = pareto.get("best", {})
+        print()
+        print("  lowest energy:     %s" % SHORT.get(best.get("total_energy"),
+                                                    best.get("total_energy")))
+        print("  lowest turnaround: %s" % SHORT.get(best.get("avg_turnaround"),
+                                                    best.get("avg_turnaround")))
+        print("  balanced (knee):   %s" % SHORT.get(pareto.get("knee"),
+                                                    pareto.get("knee")))
+
+    print()
+    print("=" * 78)
+    print("SUMMARY: times each policy was on the Pareto frontier (of %d workloads)"
+          % len(samples))
+    print("=" * 78)
+    for key in ALGOS:
+        count = frontier_counts.get(key, 0)
+        bar = "#" * count
+        print("  %-6s %2d  %s" % (SHORT.get(key, key), count, bar))
+    print()
+    print("A policy on the frontier is not beaten on both energy and")
+    print("turnaround at once. Several can share it: that is the trade-off,")
+    print("not a tie to be broken.")
+
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print()
+        print("Wrote %d rows to %s" % (len(rows), args.csv))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

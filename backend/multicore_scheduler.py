@@ -5,7 +5,14 @@ Implements parallel execution of processes across multiple CPU cores
 
 import copy
 from typing import List, Dict, Any, Tuple
-from algorithms import Process
+
+from sim.params import EnergyParams, HIGH
+from sim.process import Process
+
+# Multi-core deliberately does not do DVFS; every core runs flat out. Keeping
+# the parameters here makes that choice explicit rather than implicit.
+FIXED_PARAMS = EnergyParams()
+TICKS_PER_UNIT = FIXED_PARAMS.ticks_per_unit
 
 
 def multicore_schedule(processes_input: List[Dict], num_cores: int, algorithm: str, quantum: int = 2, threshold: float = None) -> Dict[str, Any]:
@@ -112,12 +119,26 @@ def multicore_schedule(processes_input: List[Dict], num_cores: int, algorithm: s
                 proc.remaining -= exec_time
                 core['total_busy_time'] += exec_time
                 
-                # Add to core's gantt chart
+                # Add to the core's gantt chart. Multi-core runs at a
+                # fixed HIGH clock -- DVFS is modelled for the single-core
+                # engine only -- but the segments carry the same fields so
+                # the shared energy and rendering code works unchanged.
+                seg_start = core['busy_until'] - exec_time
                 core['gantt'].append({
                     'process': f'P{proc.pid}',
-                    'start': core['busy_until'] - exec_time,
+                    'pid': proc.pid,
+                    'start': seg_start,
                     'end': core['busy_until'],
-                    'core': core['id']
+                    'start_tick': seg_start * TICKS_PER_UNIT,
+                    'end_tick': core['busy_until'] * TICKS_PER_UNIT,
+                    'duration': exec_time,
+                    'core': core['id'],
+                    'freq_state': HIGH,
+                    'freq_ghz': FIXED_PARAMS.ghz(HIGH),
+                    'f_rel': 1.0,
+                    'work': exec_time,
+                    'power': round(FIXED_PARAMS.power(HIGH), 4),
+                    'energy': round(FIXED_PARAMS.power(HIGH) * exec_time, 4),
                 })
                 
                 # Check if process completed
@@ -190,7 +211,8 @@ def multicore_schedule(processes_input: List[Dict], num_cores: int, algorithm: s
         'core_utilizations': core_utilizations,
         'load_balance_score': load_balance_score,
         'avg_core_utilization': round(avg_util, 2),
-        'speedup': calculate_speedup(processes_input, current_time, algorithm, quantum, threshold)
+        'speedup': calculate_speedup(processes_input, current_time, algorithm, quantum, threshold),
+        'dvfs': False
     }
 
 

@@ -198,12 +198,15 @@ Comprehensive table with:
 #### DVFS Parameters Table
 
 Shows configuration:
-- **Frequencies**: HIGH (1.0), MED (0.7), LOW (0.4)
-- **Power Levels**: HIGH (5.0), MED (2.1), LOW (0.6), IDLE (0.2)
-- **Thresholds**: High (0.6), Low (0.2)
-- **Window Size**: 3 time units
-- **Hysteresis**: 1 time unit
-- **Context Switch Penalty**: 0.5 units
+- **Frequencies**: HIGH 3.0 GHz, MED 2.0 GHz, LOW 1.2 GHz
+- **Voltages**: 1.00 V / 0.85 V / 0.75 V
+- **Power**: HIGH 5.000 W, MED 2.901 W, LOW 1.861 W, IDLE 0.200 W
+- **Power model**: `P = c_eff * f_GHz * V^2 + p_static` (1.35, 0.95)
+- **Time per work unit**: HIGH 1.0x, MED 1.5x, LOW 2.5x -- a slower clock
+  takes proportionally longer to finish the same work
+- **Governor thresholds**: High 0.6, Low 0.2; window 3 units; hysteresis 1
+- **Context switch penalty**: 0.5 energy units
+- **Frequency change penalty**: 0.1 energy units
 
 #### Power Timeline Chart
 

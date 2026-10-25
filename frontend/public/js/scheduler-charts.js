@@ -1,132 +1,207 @@
 /**
- * Chart.js Visualization Module
- * Renders energy and performance charts
+ * Chart.js visualisations.
+ *
+ * Axis, grid, tooltip and legend styling comes from Theme.applyChartDefaults,
+ * so none of it is repeated here. Series colours come from Theme.series and
+ * Theme.stateColor.
  */
 
 let powerChart = null;
 let frequencyChart = null;
 let energyComparisonChart = null;
+let residencyChart = null;
+
+function destroyChart(chart) {
+    if (chart) {
+        chart.destroy();
+    }
+    return null;
+}
+
+/* ====================== Energy analysis view ========================== */
 
 function renderEnergyCharts(energyData, containerId = 'energyCharts') {
     const container = document.getElementById(containerId);
     if (!container) return;
 
-    // Render energy summary
-    let html = '<div class="energy-summary">';
+    const params = energyData.parameters || {};
+    const residency = energyData.frequency_residency || {};
+
+    let html = '';
+
+    // --- headline figures ---------------------------------------------
     html += '<div class="metrics-grid">';
-    
-    html += `
-        <div class="metric-card">
-            <div class="metric-label"><i class="fas fa-bolt"></i> Total Energy</div>
-            <div class="metric-value" style="color: #f59e0b;">${energyData.total_energy}</div>
-            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">Energy Units</div>
-        </div>
-    `;
-    
-    html += `
-        <div class="metric-card">
-            <div class="metric-label"><i class="fas fa-fire"></i> Busy Energy</div>
-            <div class="metric-value" style="color: #ef4444;">${energyData.busy_energy}</div>
-            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">Energy Units</div>
-        </div>
-    `;
-    
-    html += `
-        <div class="metric-card">
-            <div class="metric-label"><i class="fas fa-moon"></i> Idle Energy</div>
-            <div class="metric-value" style="color: #64748b;">${energyData.idle_energy}</div>
-            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">Energy Units</div>
-        </div>
-    `;
-    
-    html += `
-        <div class="metric-card">
-            <div class="metric-label"><i class="fas fa-exchange-alt"></i> Context Switch Energy</div>
-            <div class="metric-value" style="color: #8b5cf6;">${energyData.context_switch_energy}</div>
-            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">Energy Units</div>
-        </div>
-    `;
-    
-    html += `
-        <div class="metric-card">
-            <div class="metric-label"><i class="fas fa-tachometer-alt"></i> Avg Power</div>
-            <div class="metric-value" style="color: #10b981;">${energyData.avg_power}</div>
-            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">Power Units/Time</div>
-        </div>
-    `;
-    
-    html += '</div></div>';
-    
-    // DVFS Parameters
-    html += '<div class="energy-params">';
-    html += '<h3 style="grid-column: 1 / -1; margin-bottom: 1rem;"><i class="fas fa-cog"></i> DVFS Parameters</h3>';
-    
-    const params = energyData.parameters;
-    html += `<div class="param-item"><span class="param-label">HIGH Frequency:</span><span class="param-value">${params.freq_high}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">MED Frequency:</span><span class="param-value">${params.freq_med}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">LOW Frequency:</span><span class="param-value">${params.freq_low}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">HIGH Power:</span><span class="param-value">${params.power_high}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">MED Power:</span><span class="param-value">${params.power_med}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">LOW Power:</span><span class="param-value">${params.power_low}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">IDLE Power:</span><span class="param-value">${params.power_idle}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">Context Switch Penalty:</span><span class="param-value">${params.context_switch_penalty}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">Utilization Threshold (High):</span><span class="param-value">${params.util_threshold_high}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">Utilization Threshold (Low):</span><span class="param-value">${params.util_threshold_low}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">Window Size:</span><span class="param-value">${params.window_size}</span></div>`;
-    html += `<div class="param-item"><span class="param-label">Hysteresis:</span><span class="param-value">${params.hysteresis}</span></div>`;
-    
+    const cards = [
+        ['fa-bolt', 'total energy', energyData.total_energy, 'energy units',
+         Theme.series.energy],
+        ['fa-fire', 'busy energy', energyData.busy_energy, 'executing',
+         Theme.palette.red],
+        ['fa-moon', 'idle energy', energyData.idle_energy, 'clock-gated',
+         Theme.palette.grey],
+        ['fa-right-left', 'switch energy', energyData.context_switch_energy,
+         'context switches', Theme.palette.magenta],
+        ['fa-gauge-high', 'clock-change energy', energyData.freq_switch_energy,
+         energyData.frequency_switches + ' transitions', Theme.palette.yellow],
+        ['fa-tachometer-alt', 'avg power', energyData.avg_power,
+         'watts (model)', Theme.palette.green]
+    ];
+    cards.forEach(([icon, label, value, unit, color]) => {
+        html += `
+            <div class="metric-card">
+                <div class="metric-label"><i class="fas ${icon}"></i> ${label}</div>
+                <div class="metric-value" style="color:${color}">${fmt(value)}</div>
+                <div class="metric-unit">${unit}</div>
+            </div>
+        `;
+    });
     html += '</div>';
-    
-    // Chart canvases
-    html += '<div class="chart-container" style="margin-top: 2rem;"><h3><i class="fas fa-chart-line"></i> Power Timeline</h3><canvas id="powerChart"></canvas></div>';
-    html += '<div class="chart-container"><h3><i class="fas fa-chart-area"></i> Frequency Timeline</h3><canvas id="frequencyChart"></canvas></div>';
-    
+
+    // --- energy-delay -------------------------------------------------
+    if (energyData.edp !== undefined) {
+        html += '<div class="note">';
+        html += '<b>energy-delay:</b> EDP ' + fmt(energyData.edp)
+             + ' &middot; ED&sup2;P ' + fmt(energyData.ed2p)
+             + ' &middot; ' + fmt(energyData.energy_per_process)
+             + ' energy units per process. ';
+        html += 'EDP weights energy and delay equally; ED&sup2;P penalises '
+             + 'delay harder, so it favours finishing sooner even at some '
+             + 'energy cost.';
+        html += '</div>';
+    }
+
+    // --- where the time went ------------------------------------------
+    html += '<div class="card"><div class="card-header"><h2>clock residency</h2></div>';
+    html += '<div class="card-body">';
+    html += '<p class="prompt">share of <b>busy</b> time spent in each frequency state</p>';
+    html += '<div class="table-wrapper"><table><thead><tr>'
+         + '<th>state</th><th class="num">GHz</th><th class="num">power</th>'
+         + '<th class="num">by busy time</th><th class="num">by work done</th>'
+         + '<th class="num">energy</th><th></th></tr></thead><tbody>';
+
+    ['HIGH', 'MED', 'LOW'].forEach(state => {
+        const share = residency[state] || 0;
+        const byWork = (energyData.residency_by_work || {})[state] || 0;
+        const energy = (energyData.energy_by_state || {})[state] || 0;
+        const ghzKey = 'freq_' + state.toLowerCase() + '_ghz';
+        const powerKey = 'power_' + state.toLowerCase();
+        const bars = Math.round(share * 30);
+        html += '<tr>'
+             + `<td><span class="badge ${state}">${state}</span></td>`
+             + `<td class="num">${fmt(params[ghzKey])}</td>`
+             + `<td class="num">${fmt(params[powerKey])} W</td>`
+             + `<td class="num">${(share * 100).toFixed(1)}%</td>`
+             + `<td class="num">${(byWork * 100).toFixed(1)}%</td>`
+             + `<td class="num">${fmt(energy)}</td>`
+             + `<td class="text-bar" style="color:${Theme.stateColor(state)}">`
+             + '█'.repeat(bars) + '</td>'
+             + '</tr>';
+    });
+    html += '</tbody></table></div>';
+
+    // The two denominators diverge by exactly the time-dilation factors, so
+    // stating both makes the stretch visible as a number rather than only as
+    // a wider bar on a chart.
+    html += '<div class="note">Residency <b>by busy time</b> and <b>by work '
+         + 'done</b> differ because slower states take longer to do the same '
+         + 'work: 1.5&times; at MED, 2.5&times; at LOW. A state with a bigger '
+         + 'share of time than of work is one the CPU was crawling in.</div>';
+    html += '</div></div>';
+
+    // --- the model itself ---------------------------------------------
+    html += '<div class="energy-params">';
+    html += '<h3>dvfs model parameters</h3>';
+    const rows = [
+        ['power formula', params.power_formula],
+        ['reference clock', fmt(params.f_ref_ghz) + ' GHz'],
+        ['HIGH', fmt(params.freq_high_ghz) + ' GHz @ ' + fmt(params.volts_high)
+                 + ' V = ' + fmt(params.power_high) + ' W'],
+        ['MED', fmt(params.freq_med_ghz) + ' GHz @ ' + fmt(params.volts_med)
+                + ' V = ' + fmt(params.power_med) + ' W'],
+        ['LOW', fmt(params.freq_low_ghz) + ' GHz @ ' + fmt(params.volts_low)
+                + ' V = ' + fmt(params.power_low) + ' W'],
+        ['idle power', fmt(params.power_idle) + ' W'],
+        ['c_eff', fmt(params.c_eff) + ' W per GHz·V²'],
+        ['p_static (leakage)', fmt(params.p_static) + ' W'],
+        ['context-switch penalty', fmt(params.context_switch_penalty)],
+        ['clock-change penalty', fmt(params.freq_switch_penalty)],
+        ['governor', energyData.governor || '-'],
+        ['util thresholds', fmt(params.util_threshold_high) + ' / '
+                            + fmt(params.util_threshold_low)],
+        ['window / hysteresis', fmt(params.window_size) + ' / '
+                                + fmt(params.hysteresis)]
+    ];
+    rows.forEach(([label, value]) => {
+        html += `<div class="param-item"><span class="param-label">${label}</span>`
+             + `<span class="param-value">${value === undefined ? '-' : value}</span></div>`;
+    });
+
+    if (params.energy_per_work_unit) {
+        html += '<h3 style="margin-top:0.85rem">energy per unit of work</h3>';
+        ['HIGH', 'MED', 'LOW'].forEach(state => {
+            const dilation = (params.time_dilation || {})[state];
+            html += `<div class="param-item"><span class="param-label">${state}`
+                 + ` (${fmt(dilation)}× time)</span>`
+                 + `<span class="param-value">`
+                 + `${fmt(params.energy_per_work_unit[state])}</span></div>`;
+        });
+    }
+    html += '</div>';
+
+    // The interior optimum is the whole reason there is a decision to make,
+    // so say it out loud rather than leaving it in a table.
+    if (params.energy_per_work_unit) {
+        const e = params.energy_per_work_unit;
+        const best = ['HIGH', 'MED', 'LOW']
+            .reduce((a, b) => (e[a] <= e[b] ? a : b));
+        html += '<div class="note warn">Dynamic energy per unit of work falls '
+             + 'as V&sup2; when the clock drops, but static energy rises as '
+             + '1/f. With this leakage floor the cheapest state is <b>' + best
+             + '</b> &mdash; so running as slowly as possible is not the '
+             + 'energy-optimal strategy. Sweep <code>p_static</code> to see '
+             + 'that optimum move.</div>';
+    }
+
+    // --- charts --------------------------------------------------------
+    html += '<div class="chart-container"><h3><i class="fas fa-chart-line"></i>'
+         + ' power and utilisation over time</h3>'
+         + '<canvas id="powerChart"></canvas></div>';
+    html += '<div class="chart-container"><h3><i class="fas fa-chart-area"></i>'
+         + ' frequency state over time</h3>'
+         + '<canvas id="frequencyChart"></canvas></div>';
+
     container.innerHTML = html;
-    
-    // Render charts
+
     setTimeout(() => {
         renderPowerChart(energyData.power_timeline);
-        renderFrequencyChart(energyData.frequency_timeline);
-    }, 100);
+        renderFrequencyChart(energyData.frequency_timeline, params);
+    }, 60);
 }
 
 function renderPowerChart(powerTimeline) {
     const canvas = document.getElementById('powerChart');
-    if (!canvas) return;
+    if (!canvas || !powerTimeline || !powerTimeline.length) return;
 
-    const ctx = canvas.getContext('2d');
-    
-    if (powerChart) {
-        powerChart.destroy();
-    }
-    
-    const times = powerTimeline.map(p => p.time);
-    const powers = powerTimeline.map(p => p.power);
-    const utilizations = powerTimeline.map(p => p.utilization);
-    
-    powerChart = new Chart(ctx, {
+    powerChart = destroyChart(powerChart);
+    powerChart = new Chart(canvas.getContext('2d'), {
         type: 'line',
         data: {
-            labels: times,
+            labels: powerTimeline.map(p => p.time),
             datasets: [
                 {
-                    label: 'Power Consumption',
-                    data: powers,
-                    borderColor: '#f59e0b',
-                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
-                    borderWidth: 2,
+                    label: 'power (W)',
+                    data: powerTimeline.map(p => p.power),
+                    borderColor: Theme.series.power,
+                    backgroundColor: Theme.alpha(Theme.series.power, 0.12),
                     fill: true,
-                    tension: 0.3,
+                    stepped: true,
                     yAxisID: 'y'
                 },
                 {
-                    label: 'CPU Utilization',
-                    data: utilizations,
-                    borderColor: '#3b82f6',
-                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
-                    borderWidth: 2,
+                    label: 'utilisation',
+                    data: powerTimeline.map(p => p.utilization),
+                    borderColor: Theme.series.utilization,
+                    backgroundColor: Theme.alpha(Theme.series.utilization, 0.08),
                     fill: true,
-                    tension: 0.3,
                     yAxisID: 'y1'
                 }
             ]
@@ -134,200 +209,112 @@ function renderPowerChart(powerTimeline) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false,
-            },
-            plugins: {
-                legend: {
-                    labels: {
-                        color: '#cbd5e1',
-                        font: { size: 12 }
-                    }
-                },
-                tooltip: {
-                    backgroundColor: '#1e293b',
-                    titleColor: '#f1f5f9',
-                    bodyColor: '#cbd5e1',
-                    borderColor: '#334155',
-                    borderWidth: 1
-                }
-            },
+            interaction: { mode: 'index', intersect: false },
             scales: {
-                x: {
-                    title: {
-                        display: true,
-                        text: 'Time',
-                        color: '#cbd5e1'
-                    },
-                    ticks: { color: '#cbd5e1' },
-                    grid: { color: 'rgba(51, 65, 85, 0.5)' }
-                },
-                y: {
-                    type: 'linear',
-                    display: true,
-                    position: 'left',
-                    title: {
-                        display: true,
-                        text: 'Power (units)',
-                        color: '#cbd5e1'
-                    },
-                    ticks: { color: '#cbd5e1' },
-                    grid: { color: 'rgba(51, 65, 85, 0.5)' }
-                },
-                y1: {
-                    type: 'linear',
-                    display: true,
-                    position: 'right',
-                    title: {
-                        display: true,
-                        text: 'Utilization (0-1)',
-                        color: '#cbd5e1'
-                    },
-                    ticks: { color: '#cbd5e1' },
+                x: Theme.axis('simulated time'),
+                y: Theme.axis('power (W)', {
+                    type: 'linear', position: 'left', beginAtZero: true
+                }),
+                y1: Theme.axis('utilisation', {
+                    type: 'linear', position: 'right', min: 0, max: 1.05,
                     grid: { drawOnChartArea: false }
-                }
+                })
             }
         }
     });
 }
 
-function renderFrequencyChart(frequencyTimeline) {
+function renderFrequencyChart(frequencyTimeline, params) {
     const canvas = document.getElementById('frequencyChart');
-    if (!canvas) return;
+    if (!canvas || !frequencyTimeline || !frequencyTimeline.length) return;
 
-    const ctx = canvas.getContext('2d');
-    
-    if (frequencyChart) {
-        frequencyChart.destroy();
-    }
-    
-    const times = frequencyTimeline.map(f => f.time);
-    const frequencies = frequencyTimeline.map(f => f.frequency);
+    frequencyChart = destroyChart(frequencyChart);
+
     const states = frequencyTimeline.map(f => f.state);
-    
-    // Color code by state
-    const backgroundColors = states.map(state => {
-        switch(state) {
-            case 'HIGH': return 'rgba(239, 68, 68, 0.6)';
-            case 'MED': return 'rgba(245, 158, 11, 0.6)';
-            case 'LOW': return 'rgba(16, 185, 129, 0.6)';
-            case 'IDLE': return 'rgba(100, 116, 139, 0.6)';
-            default: return 'rgba(59, 130, 246, 0.6)';
-        }
-    });
-    
-    frequencyChart = new Chart(ctx, {
+    const colors = states.map(s => Theme.alpha(Theme.stateColor(s), 0.75));
+    const ghz = frequencyTimeline.map(f => f.frequency_ghz);
+    const maxGhz = (params && params.freq_high_ghz) || 3.0;
+
+    frequencyChart = new Chart(canvas.getContext('2d'), {
         type: 'bar',
         data: {
-            labels: times,
+            labels: frequencyTimeline.map(f => f.time),
             datasets: [{
-                label: 'CPU Frequency',
-                data: frequencies,
-                backgroundColor: backgroundColors,
-                borderColor: backgroundColors.map(c => c.replace('0.6', '1')),
-                borderWidth: 1
+                label: 'clock (GHz)',
+                // Plotted in GHz rather than the normalised 0..1 ratio, with
+                // the axis scaled to the top operating point so nothing clips.
+                data: ghz,
+                backgroundColor: colors,
+                borderColor: states.map(s => Theme.stateColor(s)),
+                borderWidth: 1,
+                barPercentage: 1,
+                categoryPercentage: 1
             }]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: {
-                    labels: {
-                        color: '#cbd5e1',
-                        font: { size: 12 }
-                    }
-                },
                 tooltip: {
-                    backgroundColor: '#1e293b',
-                    titleColor: '#f1f5f9',
-                    bodyColor: '#cbd5e1',
-                    borderColor: '#334155',
-                    borderWidth: 1,
                     callbacks: {
-                        afterLabel: function(context) {
-                            return 'State: ' + states[context.dataIndex];
-                        }
+                        afterLabel: ctx => 'state: ' + states[ctx.dataIndex]
+                                    + '  power: '
+                                    + frequencyTimeline[ctx.dataIndex].power + ' W'
                     }
                 }
             },
             scales: {
-                x: {
-                    title: {
-                        display: true,
-                        text: 'Time',
-                        color: '#cbd5e1'
-                    },
-                    ticks: { color: '#cbd5e1' },
-                    grid: { color: 'rgba(51, 65, 85, 0.5)' }
-                },
-                y: {
-                    title: {
-                        display: true,
-                        text: 'Frequency',
-                        color: '#cbd5e1'
-                    },
-                    ticks: { color: '#cbd5e1' },
-                    grid: { color: 'rgba(51, 65, 85, 0.5)' },
-                    beginAtZero: true,
-                    max: 1.2
-                }
+                x: Theme.axis('simulated time'),
+                y: Theme.axis('clock (GHz)', {
+                    beginAtZero: true, max: maxGhz * 1.1
+                })
             }
         }
     });
 }
 
+/* ====================== Comparison chart ============================== */
+
 function renderComparisonChart(comparisonData, containerId = 'comparisonChart') {
     const container = document.getElementById(containerId);
     if (!container) return;
 
-    let html = '<div class="chart-container" style="height: 500px;"><canvas id="comparisonCanvas"></canvas></div>';
-    container.innerHTML = html;
-    
+    const keys = Object.keys(comparisonData)
+        .filter(k => k !== '_analysis' && !comparisonData[k].error);
+
+    container.innerHTML = '<div class="chart-container tall">'
+        + '<h3><i class="fas fa-chart-column"></i> policy comparison</h3>'
+        + '<canvas id="comparisonCanvas"></canvas></div>';
+
     setTimeout(() => {
         const canvas = document.getElementById('comparisonCanvas');
         if (!canvas) return;
-        
-        const ctx = canvas.getContext('2d');
-        
-        if (energyComparisonChart) {
-            energyComparisonChart.destroy();
-        }
-        
-        const algorithms = Object.keys(comparisonData);
-        const energies = algorithms.map(algo => comparisonData[algo].total_energy || 0);
-        const turnarounds = algorithms.map(algo => comparisonData[algo].avg_turnaround || 0);
-        const waitings = algorithms.map(algo => comparisonData[algo].avg_waiting || 0);
-        const contextSwitches = algorithms.map(algo => comparisonData[algo].context_switches || 0);
-        
-        energyComparisonChart = new Chart(ctx, {
+
+        energyComparisonChart = destroyChart(energyComparisonChart);
+        energyComparisonChart = new Chart(canvas.getContext('2d'), {
             type: 'bar',
             data: {
-                labels: algorithms.map(a => a.toUpperCase().replace('_', ' ')),
+                labels: keys.map(shortName),
                 datasets: [
                     {
-                        label: 'Total Energy',
-                        data: energies,
-                        backgroundColor: 'rgba(245, 158, 11, 0.7)',
-                        borderColor: '#f59e0b',
-                        borderWidth: 2,
+                        label: 'total energy',
+                        data: keys.map(k => comparisonData[k].total_energy),
+                        backgroundColor: Theme.alpha(Theme.series.energy, 0.7),
+                        borderColor: Theme.series.energy,
                         yAxisID: 'y'
                     },
                     {
-                        label: 'Avg Turnaround Time',
-                        data: turnarounds,
-                        backgroundColor: 'rgba(59, 130, 246, 0.7)',
-                        borderColor: '#3b82f6',
-                        borderWidth: 2,
+                        label: 'avg turnaround',
+                        data: keys.map(k => comparisonData[k].avg_turnaround),
+                        backgroundColor: Theme.alpha(Theme.series.turnaround, 0.7),
+                        borderColor: Theme.series.turnaround,
                         yAxisID: 'y1'
                     },
                     {
-                        label: 'Context Switches',
-                        data: contextSwitches,
-                        backgroundColor: 'rgba(139, 92, 246, 0.7)',
-                        borderColor: '#8b5cf6',
-                        borderWidth: 2,
+                        label: 'context switches',
+                        data: keys.map(k => comparisonData[k].context_switches),
+                        backgroundColor: Theme.alpha(Theme.series.switches, 0.7),
+                        borderColor: Theme.series.switches,
                         yAxisID: 'y1'
                     }
                 ]
@@ -335,58 +322,33 @@ function renderComparisonChart(comparisonData, containerId = 'comparisonChart') 
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: {
-                    legend: {
-                        labels: {
-                            color: '#cbd5e1',
-                            font: { size: 12 }
-                        }
-                    },
-                    title: {
-                        display: true,
-                        text: 'Algorithm Performance Comparison',
-                        color: '#f1f5f9',
-                        font: { size: 16, weight: 'bold' }
-                    },
-                    tooltip: {
-                        backgroundColor: '#1e293b',
-                        titleColor: '#f1f5f9',
-                        bodyColor: '#cbd5e1',
-                        borderColor: '#334155',
-                        borderWidth: 1
-                    }
-                },
                 scales: {
-                    x: {
-                        ticks: { color: '#cbd5e1' },
-                        grid: { color: 'rgba(51, 65, 85, 0.5)' }
-                    },
-                    y: {
-                        type: 'linear',
-                        display: true,
-                        position: 'left',
-                        title: {
-                            display: true,
-                            text: 'Energy (units)',
-                            color: '#cbd5e1'
-                        },
-                        ticks: { color: '#cbd5e1' },
-                        grid: { color: 'rgba(51, 65, 85, 0.5)' }
-                    },
-                    y1: {
-                        type: 'linear',
-                        display: true,
-                        position: 'right',
-                        title: {
-                            display: true,
-                            text: 'Time / Count',
-                            color: '#cbd5e1'
-                        },
-                        ticks: { color: '#cbd5e1' },
+                    x: Theme.axis(null),
+                    y: Theme.axis('energy units', {
+                        type: 'linear', position: 'left', beginAtZero: true
+                    }),
+                    y1: Theme.axis('time / count', {
+                        type: 'linear', position: 'right', beginAtZero: true,
                         grid: { drawOnChartArea: false }
-                    }
+                    })
                 }
             }
         });
-    }, 100);
+    }, 60);
+}
+
+/** Short labels, so the axis stays legible. */
+function shortName(key) {
+    const names = {
+        fcfs: 'FCFS',
+        sjf: 'SJF',
+        sjf_non_preemptive: 'SJF',
+        sjf_preemptive: 'SRTF',
+        srtf: 'SRTF',
+        round_robin: 'RR',
+        priority: 'PRIO',
+        priority_preemptive: 'PRIO-P',
+        eah: 'EAH'
+    };
+    return names[key] || key.toUpperCase().replace(/_/g, ' ');
 }

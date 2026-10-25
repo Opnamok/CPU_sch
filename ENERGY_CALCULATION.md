@@ -12,27 +12,34 @@ EnergiX compares each scheduling algorithm using these five measurable metrics:
 |--------|------|---------|----------------|
 | **Completion Time (CT)** | time units | `Last_Finish_Time - First_Arrival_Time` | Measures throughput |
 | **Average Turnaround Time (TAT)** | time units | `Σ(Completion_Time - Arrival_Time) / n` | Standard academic performance metric |
-| **Average Waiting Time (WT)** | time units | `Σ(TAT - Burst_Time) / n` | Measures efficiency of scheduler |
+| **Average Waiting Time (WT)** | time units | `Σ(TAT - Execution_Time) / n` | Measures efficiency of scheduler |
 | **Context Switch Count (CS)** | count | `Number of process transitions` | Higher switches → more overhead |
-| **Total Energy Consumption (E)** | energy units | `Σ(Power × Duration) + (CS × 0.5)` | Measures energy efficiency |
+| **Total Energy Consumption (E)** | energy units | `Σ(Power × Duration) + (CS × 0.5) + (ΔF × 0.1)` | Measures energy efficiency |
 
 These five metrics are the exact criteria on which EnergiX evaluates algorithms.
 
 ### 2. Energy Model (Simplified DVFS Criteria)
 
-EnergiX uses a **4-state DVFS model**:
+EnergiX uses a **4-state DVFS model**, with power derived from the report's
+`P ∝ f·V²` relationship plus a static leakage floor:
 
-- **HIGH** (5.0 W)
-- **MED** (2.1 W)
-- **LOW** (0.6 W)
-- **IDLE** (0.2 W)
+| State | Frequency | Power |
+|---|---|---|
+| **HIGH** | 3.0 GHz @ 1.00 V | 5.000 W |
+| **MED** | 2.0 GHz @ 0.85 V | 2.901 W |
+| **LOW** | 1.2 GHz @ 0.75 V | 1.861 W |
+| **IDLE** | clock-gated | 0.200 W |
 
 **Energy formula:**
 ```
-Energy = Σ(Power_state × Duration) + (Context_Switches × 0.5)
+P(state) = c_eff · f_GHz · V² + p_static
+Energy   = Σ(P_state × Duration) + (Context_Switches × 0.5)
+                                 + (Frequency_Changes × 0.1)
 ```
 
-This provides objective energy comparison.
+Crucially, the chosen frequency also determines **how long the work takes**:
+one unit of work occupies 1.0 time units at HIGH, 1.5 at MED and 2.5 at LOW.
+See Part I for why MED, not LOW, is the energy-optimal state.
 
 ### 3. Algorithm Used for Selecting the Best Scheduler
 
@@ -108,25 +115,30 @@ Simplicity Ranking:
 ### Part I: Energy Calculation Model
 
 1. [Power States and Parameters](#power-states-and-parameters)
-2. [Energy Calculation Components](#energy-calculation-components)
-3. [DVFS Algorithm](#dvfs-dynamic-voltage-frequency-scaling)
-4. [Complete Energy Calculation Example](#example-calculation)
-5. [Algorithm Energy Comparison](#algorithm-comparison-energy-impact)
+2. [Time: integer ticks](#time-integer-ticks)
+3. [Energy Calculation](#energy-calculation)
+4. [The critical frequency](#the-critical-frequency)
+5. [Governors](#governors)
+6. [The EAH decision rule](#the-eah-decision-rule)
+7. [Worked example](#worked-example)
+8. [Metrics](#metrics)
+9. [Analysis beyond a single run](#analysis-beyond-a-single-run)
+10. [Assumptions and limitations](#assumptions-and-limitations)
+11. [Where this is implemented](#where-this-is-implemented)
 
 ### Part II: Best Algorithm Selection
 
-6. [Metrics Used for Comparison](#metrics-used-for-comparison)
-7. [Adaptive Weighting System](#adaptive-weighting-system)
-8. [Workload Analysis Algorithm](#workload-analysis-algorithm)
-9. [Normalization and Scoring](#normalization-and-scoring)
-10. [Tie-Breaking Rules](#tie-breaking-rules)
-11. [Efficiency Analysis](#why-this-method-is-efficient)
+12. [Metrics Used for Comparison](#metrics-used-for-comparison)
+13. [Adaptive Weighting System](#adaptive-weighting-system)
+14. [Workload Analysis Algorithm](#workload-analysis-algorithm)
+15. [Normalization and Scoring](#normalization-and-scoring)
+16. [Tie-Breaking Rules](#tie-breaking-rules)
+17. [Efficiency Analysis](#why-this-method-is-efficient)
 
 ### Part III: Academic Foundation
 
-12. [Parameters Summary](#parameters-summary)
-13. [Validation and References](#validation-and-references)
-14. [Complete Example with All Steps](#complete-algorithm-selection-example)
+18. [Validation and References](#validation-and-references)
+19. [Complete Example with All Steps](#complete-algorithm-selection-example)
 
 ---
 
@@ -144,427 +156,368 @@ This document provides a comprehensive explanation of:
 
 ---
 
-## Part I: Energy Calculation Model (Detailed)
+## Part I: Energy Calculation Model
 
 ### Overview
 
-This section explains the energy calculation methodology used in the EnergiX CPU Scheduler, including DVFS (Dynamic Voltage Frequency Scaling) power states, energy formulas, and parameters.
+Energy is accumulated **during** the simulation, not reconstructed afterwards.
+That distinction is the whole point of the model: the scheduler chooses a
+frequency before each unit of work runs, and that choice determines both the
+power drawn and how long the work takes.
+
+An earlier version of this simulator computed energy by replaying a finished
+Gantt chart through a governor. Under that design frequency could not affect
+any completion time, and every algorithm received an identical frequency
+trace — so the performance/energy trade-off this project exists to study never
+appeared in the numbers. The engine in `backend/sim/engine.py` fixes that.
 
 ---
 
 ## Power States and Parameters
 
-### CPU Frequency States
+### Operating points
 
-The system uses 4 distinct power states based on CPU utilization:
+Three operating points, at the frequencies the project report specifies.
+Voltage rises with frequency, as it must on real silicon.
 
-| State | Frequency | Relative Speed | Power (W) | Use Case |
-|-------|-----------|----------------|-----------|----------|
-| **HIGH** | 1.0 GHz | 100% | 5.0 | Heavy workload (util > 60%) |
-| **MED** | 0.7 GHz | 70% | 2.1 | Moderate workload (20-60% util) |
-| **LOW** | 0.4 GHz | 40% | 0.6 | Light workload (util < 20%) |
-| **IDLE** | 0.0 GHz | 0% | 0.2 | No process running |
+| State | GHz | V | f_rel | P = c_eff·f·V² + p_static | ticks/work | time dilation | energy/work |
+|---|---|---|---|---|---|---|---|
+| HIGH | 3.0 | 1.00 | 1.0000 | 4.0500 + 0.95 = **5.0000 W** | 2 | 1.00× | **5.0000** |
+| MED | 2.0 | 0.85 | 0.6667 | 1.9507 + 0.95 = **2.9007 W** | 3 | 1.50× | **4.3511** |
+| LOW | 1.2 | 0.75 | 0.4000 | 0.9113 + 0.95 = **1.8613 W** | 5 | 2.50× | **4.6531** |
+| IDLE | 0.0 | — | 0.0000 | **0.20 W** (clock-gated) | — | — | — |
 
-### Power Calculation Formula
+With `c_eff = 1.35 W per GHz·V²` and `p_static = 0.95 W`. These two constants
+are chosen so that HIGH comes out at exactly **5.00 W** — the figure the
+report quotes — while MED and LOW are *derived* from the model rather than
+asserted independently. The previous version hardcoded 5.0 / 2.1 / 0.6 W from
+three different coefficients, which is not a power model at all.
 
-Each frequency state has a specific power formula:
+### The power relationship
 
-```python
-# Power calculation for active states
-Power_HIGH = 5.0 × frequency_ratio  # 5.0 W
-Power_MED  = 3.0 × frequency_ratio  # 2.1 W (at 0.7 GHz)
-Power_LOW  = 1.5 × frequency_ratio  # 0.6 W (at 0.4 GHz)
-
-# Idle state
-Power_IDLE = 0.2 W (constant)
+```
+P(state) = c_eff · f_GHz · V(f)²  +  p_static
+           \__________________/     \_______/
+             dynamic (switching)     leakage
 ```
 
-**Why these values?**
-- Based on typical mobile/embedded processor specifications
-- HIGH state: Full performance mode (maximum power)
-- MED state: Balanced mode (42% of HIGH power)
-- LOW state: Power saving mode (12% of HIGH power)
-- IDLE state: Sleep mode (minimal power to maintain state)
+This is the report's `P ∝ f·V²` with a static floor added. The floor matters
+more than it looks — see "The critical frequency" below.
 
 ---
 
-## Energy Calculation Components
+## Time: integer ticks
 
-### 1. Base Energy Consumption
+**Burst time is work, not duration.** A process's burst is the work it needs
+*at the reference clock* (3.0 GHz). Running at relative frequency `f` stretches
+the wall-clock duration to `work / f`.
 
-Total energy is calculated as the sum of power consumed over time:
-
-```
-Total_Energy = Σ(Power_state × Duration_state)
-```
-
-**Where:**
-- `Power_state` = Power level at each frequency state (HIGH/MED/LOW/IDLE)
-- `Duration_state` = Time spent in each state (in time units)
-
-**Example:**
-```
-Process runs for 10 time units at HIGH frequency (5.0 W)
-Energy = 5.0 W × 10 time units = 50.0 energy units
-```
-
-### 2. Context Switch Penalty
-
-Each process switch incurs additional energy cost:
+Doing that in floating point would give fractional boundaries
+(`work / 0.4 = 2.5·work`), ugly axis labels and rounding error accumulating
+across a long schedule. The simulator instead runs on **integer ticks**:
 
 ```
-Context_Switch_Energy = Number_of_Switches × 0.5
+ticks_per_work_unit(state) = ticks_per_unit · f_ref_GHz / state.GHz
+                           = 6 / state.GHz
+                           → HIGH 2,  MED 3,  LOW 5      (all whole numbers)
 ```
 
-**Parameters:**
-- **Penalty per switch**: 0.5 energy units
-- **Reason**: Cache invalidation, pipeline flush, register save/restore
+One display time unit is 2 ticks, so `display_time = ticks / 2` is exact. A
+`.5` appears in the Gantt chart only where a MED or LOW segment genuinely ends
+on a half unit — never as rounding noise.
 
-**Why 0.5 energy units?**
-Context switching involves:
-- Saving current process state (registers, program counter)
-- Loading new process state
-- Cache misses (cold cache)
-- TLB (Translation Lookaside Buffer) flush
-- Pipeline restart
+> **Admissible frequencies.** A state is only usable when `6 / GHz` is a whole
+> number, i.e. `GHz ∈ {6.0, 3.0, 2.0, 1.5, 1.2, 1.0, …}`. A 2.4 GHz state is
+> *not* admissible with these settings; `EnergyParams.ticks_per_work_unit`
+> raises a `ValueError` naming the admissible grid rather than silently
+> rounding. Raising `ticks_per_unit` makes finer states exact.
 
-Research shows context switches can cost 1-2 microseconds on modern CPUs, with associated power spike. The 0.5 units represents this overhead.
+### Preemption granularity
 
-### 3. Total Energy Formula
+Preemptive policies advance **one unit of work** per decision, not one unit of
+time. SRTF compares *remaining work*, and remaining work does not depend on
+clock speed, so a process yields after the same amount of progress regardless
+of frequency — only the wall-clock cost of that progress changes. At a fixed
+HIGH clock this reproduces the pre-DVFS schedules exactly, which
+`backend/tests/test_regression.py` asserts against captured output.
 
-```
-Total_Energy = Computation_Energy + Context_Switch_Energy
+### Round Robin quantum
 
-Where:
-Computation_Energy = Σ(Power_freq × Time_at_freq)
-Context_Switch_Energy = Context_Switches × 0.5
-```
+The quantum is likewise denominated in **work units**: "how much progress
+before we re-decide". A wall-clock quantum would complete a frequency-dependent
+and generally fractional amount of work, which would force rational arithmetic
+through the entire simulation. The API reports `quantum_semantics: "work"` so
+this is never silently assumed.
 
 ---
 
-## DVFS (Dynamic Voltage Frequency Scaling)
+## Energy Calculation
 
-### Utilization-Based Frequency Selection
+```
+busy_energy   = Σ over busy segments   P(state) · duration
+idle_energy   = Σ over idle segments   P_idle   · duration
+cs_energy     = context_switches   · context_switch_penalty   (0.50)
+fs_energy     = frequency_switches · freq_switch_penalty      (0.10)
 
-The system dynamically adjusts CPU frequency based on workload:
-
-#### Sliding Window Approach
-
-```python
-# Parameters
-WINDOW_SIZE = 3  # time units
-HYSTERESIS = 1   # minimum time before frequency change
-
-# Calculate utilization over sliding window
-utilization = busy_time_in_window / WINDOW_SIZE
-
-# Frequency selection thresholds
-if utilization > 0.6:
-    frequency = HIGH      # Heavy load
-elif utilization > 0.2:
-    frequency = MED       # Moderate load
-else:
-    frequency = LOW       # Light load
-    
-if no_process_ready:
-    frequency = IDLE      # System idle
+total_energy  = busy_energy + idle_energy + cs_energy + fs_energy
+avg_power     = total_energy / total_elapsed_time
 ```
 
-#### Utilization Thresholds
+The frequency-switch penalty is new: changing operating point is not free on
+real hardware, and without a cost a governor would thrash between states for
+no reason.
 
-| Utilization Range | Frequency State | Reasoning |
-|-------------------|----------------|-----------|
-| > 60% | HIGH | CPU heavily utilized, need maximum performance |
-| 20% - 60% | MED | Moderate workload, balance power and performance |
-| < 20% | LOW | Light workload, prioritize energy savings |
-| 0% | IDLE | No work, minimal power to maintain state |
+### Waiting time under DVFS
 
-**Why these thresholds?**
-- **60% threshold**: Industry standard for "high load" detection
-- **20% threshold**: Below this, performance impact is negligible at lower frequencies
-- Based on Linux kernel's ondemand governor logic
-
-#### Hysteresis Mechanism
-
-```python
-# Prevents rapid frequency switching (energy waste)
-if time_in_current_frequency < HYSTERESIS:
-    maintain_current_frequency()
-else:
-    change_frequency_if_needed()
+```
+turnaround_i = completion_i − arrival_i
+waiting_i    = turnaround_i − exec_time_i        ← execution time, NOT burst
 ```
 
-**Purpose:**
-- Avoid rapid frequency transitions (each transition costs energy)
-- Stabilize frequency state for at least 1 time unit
-- Prevent "flapping" between states
+This is the subtlest consequence of coupling frequency to time, and the
+easiest thing to get wrong. A 5-unit burst run entirely at LOW *occupies* 12.5
+time units, so the textbook `turnaround − burst` would report a **negative**
+waiting time. `backend/tests/test_dvfs.py` asserts `waiting ≥ 0` for every
+process under every governor and policy.
 
 ---
 
-## Energy Calculation Algorithm
+## The critical frequency
 
-### Step-by-Step Process
+Dynamic energy per unit of work scales as **V²**, so slowing down is cheaper.
+Static energy per unit of work scales as **1/f**, so slowing down is dearer,
+because leakage is paid for longer. The sum has an interior minimum:
 
-```python
-def calculate_energy(gantt_chart, context_switches):
-    total_energy = 0
-    current_time = 0
-    frequency_history = []
-    
-    # Step 1: Analyze each time segment
-    for segment in gantt_chart:
-        start_time = segment['start']
-        end_time = segment['end']
-        duration = end_time - start_time
-        
-        # Step 2: Calculate utilization in sliding window
-        window_start = max(0, start_time - WINDOW_SIZE)
-        window_end = start_time
-        busy_time = calculate_busy_time(window_start, window_end)
-        utilization = busy_time / WINDOW_SIZE
-        
-        # Step 3: Determine frequency state
-        if segment['process'] == 'IDLE':
-            frequency_state = 'IDLE'
-            power = 0.2
-        elif utilization > 0.6:
-            frequency_state = 'HIGH'
-            power = 5.0
-        elif utilization > 0.2:
-            frequency_state = 'MED'
-            power = 2.1
-        else:
-            frequency_state = 'LOW'
-            power = 0.6
-        
-        # Step 4: Calculate energy for this segment
-        segment_energy = power × duration
-        total_energy += segment_energy
-        
-        frequency_history.append({
-            'time': start_time,
-            'frequency': frequency_state,
-            'power': power,
-            'utilization': utilization
-        })
-    
-    # Step 5: Add context switch penalty
-    switch_penalty = context_switches × 0.5
-    total_energy += switch_penalty
-    
-    return {
-        'total_energy': total_energy,
-        'computation_energy': total_energy - switch_penalty,
-        'switch_penalty': switch_penalty,
-        'frequency_history': frequency_history
-    }
-```
+| State | dynamic energy/work | static energy/work | total |
+|---|---|---|---|
+| HIGH | 4.050 | 0.950 | 5.0000 |
+| MED | 2.926 | 1.425 | **4.3511** ← cheapest |
+| LOW | 2.278 | 2.375 | 4.6531 |
+
+**MED is the energy-optimal state, and LOW is both slower *and* less efficient
+than MED.** This is not a modelling accident — it is the well-documented
+"critical frequency" effect, and it is the reason real processors do not
+simply run as slowly as possible.
+
+`p_static` is the knob that moves the optimum. Sweeping it in the UI
+(tab 6 → `p_static`) shows the energy-optimal clock migrate from LOW to MED to
+HIGH as leakage rises. At `p_static = 0.2` the optimum is LOW; at
+`p_static = 3.0` it is HIGH. This is the single most instructive plot the
+simulator produces, because it shows that "which policy is most efficient" is
+a property of the hardware as much as of the scheduler.
 
 ---
 
-## Example Calculation
+## Governors
 
-### Scenario: 3 Processes with SJF Algorithm
+The frequency decision is a pluggable strategy, selected per run:
 
-**Input:**
-```
-P1: arrival=0, burst=5, priority=2
-P2: arrival=1, burst=3, priority=1
-P3: arrival=2, burst=8, priority=3
-```
+| Governor | Behaviour |
+|---|---|
+| `utilization_window` | **Default.** Sliding-window utilisation (3 units) with hysteresis, thresholds 0.6 / 0.2. The project's original heuristic, now applied *during* the simulation. |
+| `eah_score` | The EAH urgency rule (below), usable by any policy. |
+| `ondemand_queue` | Scale with ready-queue depth. |
+| `race_to_idle` | Always HIGH, then idle. |
+| `fixed:high` / `fixed:med` / `fixed:low` | Pin the clock. The control for every experiment. |
 
-**Execution Order (SJF):**
-```
-Time 0-5: P1 (burst=5)
-Time 5-8: P2 (burst=3)
-Time 8-16: P3 (burst=8)
-```
+Making this pluggable enables the ablation that keeps the EAH claim honest:
+running **FCFS under `eah_score`** isolates the effect of frequency *choice*
+from the effect of process *ordering*. Without that separation, any energy
+difference between EAH and the baselines could just be the context-switch
+penalty wearing a different hat.
 
-**Context Switches:** 2 (P1→P2, P2→P3)
-
-### Energy Breakdown
-
-#### Segment 1: P1 execution (Time 0-5)
-
-```
-Window: [0, 3]
-Busy time: 3 time units
-Utilization: 3/3 = 100% = 1.0
-Frequency: HIGH (util > 0.6)
-Power: 5.0 W
-Duration: 5 time units
-Energy: 5.0 × 5 = 25.0 units
-```
-
-#### Segment 2: P2 execution (Time 5-8)
-
-```
-Window: [2, 5]
-Busy time: 3 time units (P1 running)
-Utilization: 3/3 = 100% = 1.0
-Frequency: HIGH (util > 0.6)
-Power: 5.0 W
-Duration: 3 time units
-Energy: 5.0 × 3 = 15.0 units
-```
-
-#### Segment 3: P3 execution (Time 8-16)
-
-```
-Window: [5, 8]
-Busy time: 3 time units (P2 running)
-Utilization: 3/3 = 100% = 1.0
-Frequency: HIGH (util > 0.6)
-Power: 5.0 W
-Duration: 8 time units
-Energy: 5.0 × 8 = 40.0 units
-```
-
-#### Context Switch Penalty
-
-```
-Switches: 2
-Penalty per switch: 0.5
-Switch penalty: 2 × 0.5 = 1.0 unit
-```
-
-### Total Energy
-
-```
-Computation Energy: 25.0 + 15.0 + 40.0 = 80.0 units
-Switch Penalty: 1.0 unit
-Total Energy: 80.0 + 1.0 = 81.0 energy units
-```
+Note that on a saturated workload the `utilization_window` governor sees
+utilisation near 1.0 and pins HIGH, paying full price for every work unit.
+That is the behaviour EAH is able to beat.
 
 ---
 
-## Algorithm Comparison: Energy Impact
+## The EAH decision rule
 
-### Context Switches and Energy
+The report's Limitations section concedes that "the exact EAH threshold logic
+and all tie-breaking assumptions are not fully specified". They are specified
+here. All weights live in `EAHWeights` in `backend/sim/params.py`.
 
-Different algorithms have different context switch counts:
-
-| Algorithm | Typical Switches | Switch Penalty | Energy Impact |
-|-----------|------------------|----------------|---------------|
-| FCFS | 3-4 | 1.5-2.0 | Low |
-| SJF Non-Preemptive | 3-4 | 1.5-2.0 | Low |
-| **EAH** | **4-5** | **2.0-2.5** | **Low** ✅ |
-| Priority (Non-Pre) | 4-5 | 2.0-2.5 | Low |
-| SRTF | 12-15 | 6.0-7.5 | High ❌ |
-| Round Robin | 15-20 | 7.5-10.0 | Very High ❌ |
-| Priority (Preemptive) | 8-12 | 4.0-6.0 | High ❌ |
-
-### Why EAH Saves Energy
-
-**1. Fewer Context Switches**
-- Non-preemptive execution
-- Minimal process switching overhead
-- Lower context switch penalty
-
-**2. Stable Frequency States**
-- Long execution periods at single frequency
-- Fewer frequency transitions
-- Better DVFS efficiency
-
-**3. Grouped Execution**
-- Short tasks run together at LOW frequency
-- Long tasks run together at HIGH frequency
-- Reduced frequency oscillation
-
-**Example Energy Savings:**
+Normalisations are taken over the ready set, each clamped to 0..1:
 
 ```
-Workload: 6 processes (3 short, 3 long)
-
-SRTF (Preemptive):
-- Computation: 82.0 units
-- Switches: 15 × 0.5 = 7.5 units
-- Total: 89.5 units
-
-EAH (Non-Preemptive):
-- Computation: 80.0 units (slightly higher TAT)
-- Switches: 5 × 0.5 = 2.5 units
-- Total: 82.5 units
-
-Energy Saved: 89.5 - 82.5 = 7.0 units (7.8% reduction)
+norm_wait(p)  = wait_ticks(p) / max(wait_ticks over ready)
+norm_short(p) = 1 − (remaining(p) − w_min) / (w_max − w_min)     # 1 = shortest
+norm_prio(p)  = 1 − (prio(p) − p_min) / (p_max − p_min)          # 1 = most important
+pressure      = min(1, |ready| / pressure_ref)                   # pressure_ref = 4
+norm_dead(p)  = 1 − normalised slack, when deadlines are present
 ```
 
----
+### Stage 1 — which process
 
-## Parameters Summary
+```
+select_score(p) = 0.35·norm_wait + 0.40·norm_short
+                + 0.25·norm_prio + 0.00·norm_dead
+```
 
-### Key Parameters Used
+Highest score wins. Tie-break order: longer wait → less remaining work → lower
+priority number → earlier arrival → **lower pid**. Terminating on pid makes
+the policy fully deterministic, which the seeded repeated-trial statistics
+depend on.
 
-| Parameter | Value | Unit | Purpose |
-|-----------|-------|------|---------|
-| **Frequency States** | | | |
-| HIGH frequency | 1.0 | GHz | Maximum performance |
-| MED frequency | 0.7 | GHz | Balanced mode |
-| LOW frequency | 0.4 | GHz | Power saving |
-| IDLE frequency | 0.0 | GHz | Sleep mode |
-| **Power Levels** | | | |
-| HIGH power | 5.0 | W | Full load power |
-| MED power | 2.1 | W | Moderate power |
-| LOW power | 0.6 | W | Minimal active power |
-| IDLE power | 0.2 | W | Standby power |
-| **Thresholds** | | | |
-| High utilization | 60% | - | Switch to HIGH freq |
-| Low utilization | 20% | - | Switch to LOW freq |
-| **DVFS Settings** | | | |
-| Sliding window | 3 | time units | Utilization calculation |
-| Hysteresis | 1 | time unit | Anti-flapping delay |
-| **Energy Costs** | | | |
-| Context switch | 0.5 | energy units | Per switch penalty |
+With `w_short` dominant and `w_wait` present, EAH behaves like SJF with an
+aging term. That is a deliberate improvement on the original "drain the whole
+short queue, then the long queue" rule, under which a steady stream of short
+arrivals could starve a long job indefinitely.
 
----
+### Stage 2 — which frequency
 
-## Validation and References
+```
+urgency(p) = 0.30·norm_wait + 0.25·norm_prio
+           + 0.25·pressure  + 0.20·norm_dead
 
-### Academic Foundation
+urgency ≥ 0.70  → HIGH
+urgency ≥ 0.30  → MED
+otherwise       → LOW
+```
 
-The energy model is based on:
+When no deadlines are present, `u_deadline` is dropped and the remaining three
+weights are renormalised to sum to 1, so urgency stays on one scale either way.
 
-1. **DVFS Research**:
-   - Pillai, P., & Shin, K. G. (2001). "Real-time dynamic voltage scaling for low-power embedded operating systems."
-   - Frequency-power relationship: P ∝ V² × f (where V ∝ f)
+`urgency_high` is 0.70 rather than 0.60 for a specific reason: queue pressure
+alone contributes about 0.31 of the scale, so a threshold of 0.60 let a merely
+*busy* queue force the top clock. At 0.70 a full queue settles on MED — the
+energy-optimal state — and HIGH is reserved for work that is genuinely urgent.
+Raising it further trades more turnaround for more energy saving; sweeping
+`urgency_high` plots that curve.
 
-2. **Context Switch Overhead**:
-   - Li, T., et al. (2007). "Operating system directed processor voltage and frequency variation."
-   - Measured overhead: 1-2 microseconds + cache effects
+**Deadline override.** If a process has a deadline and its slack falls below
+`slack_safety_units`, it is forced to HIGH regardless of score.
 
-3. **Utilization Thresholds**:
-   - Linux kernel's CPUfreq governors (ondemand, conservative)
-   - Industry-standard thresholds: 60% (up), 20% (down)
-
-### Assumptions and Simplifications
-
-**Assumptions:**
-- Linear relationship between frequency and execution time
-- Instant frequency transitions (in reality: 10-100μs)
-- Simplified power model (actual: V² × f cubic relationship)
-- No memory/IO power (CPU-only model)
-
-**Simplifications:**
-- Fixed time quantum (not variable)
-- No task migration overhead (single-core focus)
-- Uniform process characteristics
-- No temperature effects (thermal throttling ignored)
+**Mid-run resampling.** EAH remains non-preemptive, but the frequency is
+reconsidered every `resample_work` (default 1.0) units of work. A long job
+dispatched at LOW into an empty queue therefore escalates as arrivals pile up —
+adapting the clock *without paying a single extra context switch*. This is
+behaviour the utilisation-window governor structurally cannot produce.
 
 ---
 
-## Conclusion
+## Worked example
 
-The energy calculation in EnergiX is based on:
+Workload: P1(arrival 0, work 5), P2(1, 3), P3(2, 8), P4(3, 6).
+Governor `utilization_window`, quantum 2.
 
-1. **Four frequency states** with realistic power values
-2. **Utilization-based DVFS** with 60%/20% thresholds
-3. **Context switch penalty** of 0.5 energy units
-4. **Sliding window** of 3 time units for stability
-5. **Hysteresis** of 1 time unit to prevent flapping
+### EAH schedule
 
-This model provides a **realistic approximation** of energy behavior while remaining simple enough for academic demonstration and comparison of scheduling algorithms.
+| Segment | Start → End | State | Work | Power | Energy |
+|---|---|---|---|---|---|
+| P1 | 0 → 1.5 | MED | 1.0 | 2.9007 W | 4.3511 |
+| P2 | 1.5 → 4.5 | HIGH | 3.0 | 5.0000 W | 15.0000 |
+| P1 | 4.5 → 8.5 | HIGH | 4.0 | 5.0000 W | 20.0000 |
+| P4 | 8.5 → 11.5 | HIGH | 3.0 | 5.0000 W | 15.0000 |
+| P4 | 11.5 → 16 | MED | 3.0 | 2.9007 W | 13.0534 |
+| P3 | 16 → 24 | HIGH | 8.0 | 5.0000 W | 40.0000 |
 
-**Key Insight:** EAH's non-preemptive nature and task grouping strategy naturally aligns with DVFS efficiency, resulting in 7-8% energy savings compared to preemptive algorithms.
+Note P1 and P4 each change clock **mid-execution** without a context switch —
+that is the mid-run resampling. The first P1 segment takes 1.5 time units to
+do 1 unit of work: the time dilation, visible directly in the chart.
+
+```
+busy    = 4.3511 + 15 + 20 + 15 + 13.0534 + 40 = 107.40
+idle    = 0.00                     (no gaps in this schedule)
+switch  = 4 context switches × 0.50 = 2.00
+clock   = 3 frequency changes × 0.10 = 0.30
+total   = 109.70 energy units
+```
+
+### All six policies on this workload
+
+| Policy | Completion | TAT | WT | CS | clock Δ | Energy | EDP |
+|---|---|---|---|---|---|---|---|
+| FCFS | 22.5 | 11.75 | 6.12 | 3 | 1 | 110.95 | 1303.7 |
+| SJF | 22.5 | 11.25 | 5.62 | 3 | 1 | 110.95 | 1248.2 |
+| SRTF | 22.5 | 11.00 | 5.38 | 4 | 1 | 111.45 | 1226.0 |
+| Round Robin | 22.5 | 15.75 | 10.12 | 11 | 1 | 114.95 | 1810.5 |
+| Priority | 22.5 | 11.25 | 5.62 | 3 | 1 | 110.95 | 1248.2 |
+| **EAH** | 24.0 | 11.75 | 5.75 | 4 | 3 | **109.70** | 1289.0 |
+
+EAH uses the least energy and takes the longest to finish. That is the
+trade-off, stated plainly: it is not a defect in EAH and not a reason to
+declare SRTF the winner. Which one you want depends on whether you are
+optimising for battery or for latency — which is exactly why the comparison
+view reports a **Pareto frontier** rather than a single weighted score.
+
+---
+
+## Metrics
+
+| Metric | Formula | Note |
+|---|---|---|
+| Completion time | `max(completion)` | |
+| Turnaround | `completion − arrival` | |
+| Waiting | `turnaround − exec_time` | **not** `− burst`; see above |
+| Response time | `first_dispatch − arrival` | Was hardcoded to 0 before segments carried `pid` |
+| CPU utilisation | `busy_ticks / total_ticks` | Redefined: under DVFS the CPU can be 100% busy while completing work slowly |
+| Work per time | `Σ burst / completion` | The *old* utilisation definition, kept because it answers a different question |
+| Throughput | `n / completion` | |
+| Fairness | Jain's index over turnaround | |
+| Fairness (slowdown) | Jain's index over `turnaround / exec_time` | Raw turnaround calls a schedule unfair merely for containing jobs of different sizes |
+| EDP / ED²P | `E·TAT` / `E·TAT²` | ED²P penalises delay harder |
+
+---
+
+## Analysis beyond a single run
+
+The report's Future Work asks for repeated trials, parameter sweeps and
+reproducible benchmarks. All three exist:
+
+- **`POST /api/experiment`** — N seeded random workloads, every policy run on
+  the *identical* workload within each trial (common random numbers). This
+  matters: per-policy spread is routinely ±37%, far larger than the
+  differences between policies, so comparing independent averages would bury a
+  real effect in noise. The paired differences cancel the workload variance and
+  resolve a ~3% energy effect with a 95% confidence interval that excludes
+  zero. Same seed, same numbers, always.
+- **`POST /api/sweep`** — one parameter at a time, each point averaged over
+  several workloads.
+- **`POST /api/energy_delay`** — EDP, ED²P and the Pareto frontier.
+- **`POST /api/drilldown`** — per-process detail, waiting/response
+  distributions, starvation flags and clock residency reported three ways
+  (by busy time, by work done, by wall time). The divergence between the first
+  two is exactly the time dilation, expressed as a number.
+
+---
+
+## Assumptions and limitations
+
+- Energy figures are **model estimates, not hardware measurements**. The
+  constants are plausible for a mobile-class core but are not calibrated
+  against any specific processor.
+- The power model is a first-order one. Real power depends on workload
+  composition, cache and memory activity, temperature-dependent leakage, and
+  per-core voltage domains, none of which are modelled.
+- Frequency transitions cost energy but take **zero time** here
+  (`freq_switch_ticks = 0`), which keeps every segment boundary on an integer
+  tick. Real transitions take microseconds.
+- The process model has no I/O, no memory stalls and no multicore contention.
+  Multi-core simulation exists but runs at a **fixed HIGH clock**; DVFS is
+  modelled for single-core scheduling only, and the API says so via
+  `dvfs: false`.
+- Burst times are known in advance, which SJF, SRTF and EAH all depend on. Real
+  schedulers must estimate them.
+
+---
+
+## Where this is implemented
+
+| Concern | File |
+|---|---|
+| Frequency states, power model, EAH weights | `backend/sim/params.py` |
+| Tick arithmetic | `backend/sim/timebase.py` |
+| Process model | `backend/sim/process.py` |
+| Governors, EAH urgency rule | `backend/sim/governors.py` |
+| Dispatch loop, Gantt assembly, energy accumulation | `backend/sim/engine.py` |
+| The six policies | `backend/sim/policies.py` |
+| Energy summary, residency, timelines | `backend/sim/energy.py` |
+| Metrics, distributions, starvation | `backend/sim/metrics.py` |
+| Repeated trials, sweeps, Pareto | `backend/analysis/` |
+| Regression gate against pre-DVFS behaviour | `backend/tests/test_regression.py` |
+| DVFS coupling tests | `backend/tests/test_dvfs.py` |
 
 ---
 
@@ -1270,62 +1223,86 @@ Everything we use to calculate, find, analyze energy and best algorithm:
 
 ### Complete System Parameters Reference
 
-**All Values Used in Calculation:**
+All of these live in `backend/sim/params.py` and are returned by
+`GET /api/parameters`, so the UI always displays what the engine actually used.
+
+```python
+# Operating points -- EnergyParams
+f_ref_ghz      = 3.0     ticks_per_unit = 2
+freq_high_ghz  = 3.0     volts_high     = 1.00
+freq_med_ghz   = 2.0     volts_med      = 0.85
+freq_low_ghz   = 1.2     volts_low      = 0.75
+
+# Power model:  P = c_eff * f_GHz * V^2 + p_static
+c_eff          = 1.35    # W per GHz*V^2
+p_static       = 0.95    # W leakage floor while active
+power_idle     = 0.20    # W clock-gated
+
+# Derived:  HIGH 5.0000 W   MED 2.9007 W   LOW 1.8613 W
+# Ticks per work unit:  HIGH 2   MED 3   LOW 5
+# Energy per work unit: HIGH 5.0000   MED 4.3511   LOW 4.6531
+
+# Overheads
+context_switch_penalty = 0.50
+freq_switch_penalty    = 0.10
+
+# utilization_window governor
+util_threshold_high = 0.6    util_threshold_low = 0.2
+window_units        = 3.0    hysteresis_samples = 1
+
+# Starvation reporting
+starvation_wait_factor  = 4.0    starvation_ntat_factor = 5.0
+```
+
+```python
+# EAH weights -- EAHWeights
+# stage 1: which process
+w_wait = 0.35   w_short = 0.40   w_prio = 0.25   w_deadline = 0.00
+# stage 2: which frequency
+u_wait = 0.30   u_prio  = 0.25   u_pressure = 0.25   u_deadline = 0.20
+pressure_ref = 4
+urgency_high = 0.70   urgency_med = 0.30
+resample_work = 1.0   slack_safety_units = 1.0
+```
 
 ```javascript
-// Power States (Watts)
-const POWER_STATES = {
-  HIGH: 5.0,   // >60% CPU utilization
-  MEDIUM: 2.1, // 20-60% CPU utilization  
-  LOW: 0.6,    // <20% CPU utilization
-  IDLE: 0.2    // Process waiting/no execution
-};
-
-// DVFS Control Parameters
-const DVFS_CONFIG = {
-  WINDOW_SIZE: 3,              // Time units for utilization calculation
-  HIGH_THRESHOLD: 0.6,         // 60% - switch to HIGH frequency
-  LOW_THRESHOLD: 0.2,          // 20% - switch to LOW frequency
-  HYSTERESIS: 1,               // Minimum time before frequency change
-  CONTEXT_SWITCH_PENALTY: 0.5  // Energy cost per context switch
-};
-
-// Adaptive Weighting Thresholds
+// Adaptive weighting thresholds -- frontend/public/js/scheduler-main.js
 const WEIGHT_THRESHOLDS = {
-  ENERGY_VARIANCE: 0.07,       // 7% - triggers energy-focused weights
+  ENERGY_VARIANCE: 0.07,       // 7%  - triggers energy-focused weights
   SWITCH_VARIANCE: 0.50        // 50% - triggers switch-penalty weights
 };
-
-// Weight Scenarios
 const WEIGHTS = {
   ENERGY_FOCUSED: { CT: 0.10, TAT: 0.15, WT: 0.15, energy: 0.45, switches: 0.15 },
   SWITCH_PENALTY: { CT: 0.10, TAT: 0.35, WT: 0.30, energy: 0.10, switches: 0.15 },
-  BALANCED: { CT: 0.20, TAT: 0.25, WT: 0.25, energy: 0.20, switches: 0.10 }
+  BALANCED:       { CT: 0.20, TAT: 0.25, WT: 0.25, energy: 0.20, switches: 0.10 }
 };
 ```
 
+> **A caveat worth stating.** These variance thresholds were tuned when energy
+> differed between policies *only* through the context-switch penalty, so
+> energy variance was almost always tiny and the energy-focused weights rarely
+> fired. Now that frequency selection is real, energy variance is larger and
+> those weights fire more often. The weighted "best overall" label should
+> therefore be read as one opinion among several — which is why the comparison
+> view also reports the **Pareto frontier**, which needs no weights at all.
+
 ### Implementation Code Locations
 
-**Where Everything is Calculated:**
-
-1. **Energy Calculation**: `backend/energy_aware_scheduler.py` lines 45-120
-   - `calculate_energy()` function
-   - DVFS frequency selection logic
-   - Context switch penalty application
-
-2. **Best Algorithm Selection**: `frontend/public/js/scheduler-main.js` lines 820-950
-   - `detectBestAlgorithm()` function
-   - Adaptive weight selection (lines 835-865)
-   - Normalization and scoring (lines 870-920)
-   - Tie-breaking logic (lines 925-945)
-
-3. **Metric Calculations**: `backend/algorithms.py` lines 180-350
-   - Completion time, TAT, WT calculations
-   - All 6 scheduling algorithms (FCFS, SJF, SRTF, RR, Priority, EAH)
-
-4. **Workload Analysis**: `frontend/public/js/scheduler-main.js` lines 179-295
-   - 6 sample workloads with different characteristics
-   - Variance calculation functions
+| Concern | Location |
+|---|---|
+| Frequency states, power model, EAH weights | `backend/sim/params.py` |
+| Integer tick arithmetic | `backend/sim/timebase.py` |
+| The single `Process` class | `backend/sim/process.py` |
+| Governors and the EAH urgency rule | `backend/sim/governors.py` (`eah_frequency`) |
+| Dispatch loop and energy accumulation | `backend/sim/engine.py` (`run_simulation`) |
+| The six policies | `backend/sim/policies.py` |
+| Energy summary and residency | `backend/sim/energy.py` (`summarize_energy`) |
+| Metrics and distributions | `backend/sim/metrics.py` (`advanced_metrics`) |
+| Repeated trials | `backend/analysis/montecarlo.py` (`monte_carlo`) |
+| Parameter sweeps | `backend/analysis/sweep.py` (`sweep`) |
+| Pareto frontier | `backend/analysis/pareto.py` (`pareto_analysis`) |
+| Best-algorithm scoring (UI) | `frontend/public/js/scheduler-main.js` (`determineBestAlgorithms`) |
+| Sample workloads (UI) | `frontend/public/js/scheduler-main.js` (`sampleWorkloads`) |
 
 ### Why These Values?
 

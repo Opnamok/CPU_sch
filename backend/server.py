@@ -1,397 +1,530 @@
 """
-FastAPI Backend for CPU Scheduling Simulator
-Provides REST API endpoints for scheduling algorithms and energy calculations
-Merged from Flask app.py to work with FastAPI and supervisor configuration
+FastAPI backend for the Energy-Aware CPU Scheduler Simulator.
+
+One process serves both the REST API under /api and the simulator UI from
+frontend/public, so `uvicorn server:app --port 8000` is all you need. No
+database is required.
+
+Endpoints
+    GET  /api/health          service check
+    GET  /api/parameters      the energy model and EAH weights
+    GET  /api/governors       available frequency governors
+    GET  /api/sweepable       which parameters can be swept
+    POST /api/run             one algorithm
+    POST /api/all             one algorithm plus energy (what the UI calls)
+    POST /api/energy          energy for a supplied Gantt chart
+    POST /api/compare         every algorithm on one workload
+    POST /api/multicore       multi-core simulation (fixed HIGH clock)
+    POST /api/experiment      repeated seeded trials, mean +/- std dev
+    POST /api/sweep           parameter sweeps
+    POST /api/energy_delay    EDP / ED2P and the Pareto frontier
+    POST /api/drilldown       per-process detail and distributions
 """
 
-from fastapi import FastAPI, APIRouter, HTTPException
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Dict, Any, Optional
-import uuid
-from datetime import datetime, timezone
 
-# Import CPU scheduling algorithms
-from algorithms import fcfs, sjf_non_preemptive, sjf_preemptive, round_robin, priority_scheduling, calculate_advanced_metrics
-from energy_aware_scheduler import energy_aware_hybrid, calculate_dvfs_energy
+from analysis.montecarlo import monte_carlo, run_once
+from analysis.pareto import normalized_radar, pareto_analysis
+from analysis.sweep import sweep as run_sweep, sweepable
 from multicore_scheduler import multicore_schedule
-
+from schemas import (CompareRequest, DrilldownRequest, EnergyDelayRequest,
+                     EnergyRequest, ExperimentRequest, MulticoreRequest,
+                     SchedulerRequest, SweepRequest)
+from sim.energy import calculate_dvfs_energy, energy_delay, summarize_energy
+from sim.governors import DEFAULT_GOVERNOR, list_governors
+from sim.metrics import (advanced_metrics, distribution, per_process_detail,
+                         starvation_report)
+from sim.params import EAHWeights, EnergyParams, SimConfig
+from sim.policies import COMPARE_ORDER, run_algorithm
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Create the main app without a prefix
-app = FastAPI(title="CPU Scheduling Simulator API")
+# Optional MongoDB. Nothing in the simulator needs it; it exists only so a
+# deployment can persist runs if it wants to. Unset means no database, which
+# is what lets a fresh checkout run with nothing but `pip install`.
+mongo_url = os.environ.get("MONGO_URL")
+client = None
+db = None
+if mongo_url:
+    from motor.motor_asyncio import AsyncIOMotorClient  # imported lazily
 
-# Create a router with the /api prefix
+    client = AsyncIOMotorClient(mongo_url)
+    db = client[os.environ.get("DB_NAME", "energix")]
+
+app = FastAPI(title="Energy-Aware CPU Scheduler Simulator API")
+
+# CORS is registered before the router and the static mount so that it wraps
+# them. Credentials stay off: a wildcard origin combined with credentials is
+# something browsers refuse, and nothing here uses cookies.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
+
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    """Stop browsers caching the UI.
+
+    The frontend is plain files with no build step and no content hashing, so
+    an edited stylesheet or script would otherwise keep serving stale until a
+    hard reload -- which is exactly the wrong failure mode when you are
+    demonstrating a change.
+    """
+    response = await call_next(request)
+    if not request.url.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 api_router = APIRouter(prefix="/api")
 
 
-# ============================================================================
-# Pydantic Models for CPU Scheduling
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-class ProcessInput(BaseModel):
-    pid: int
-    arrival: int
-    burst: int
-    priority: Optional[int] = 0
-
-class SchedulerRequest(BaseModel):
-    algorithm: str
-    processes: List[ProcessInput]
-    quantum: Optional[int] = 2
-    threshold: Optional[float] = None
-    preemptive: Optional[bool] = False
-
-class EnergyRequest(BaseModel):
-    gantt: List[Dict[str, Any]]
-    context_switches: int
-
-class CompareRequest(BaseModel):
-    processes: List[ProcessInput]
-    quantum: Optional[int] = 2
-    task_threshold: Optional[float] = None
-
-class MulticoreRequest(BaseModel):
-    processes: List[ProcessInput]
-    num_cores: int = Field(ge=2, le=8)  # 2-8 cores
-    algorithm: str = "fcfs"
-    quantum: Optional[int] = 2
-    threshold: Optional[float] = None
+def _processes(request) -> List[Dict[str, Any]]:
+    procs = [p.model_dump() for p in (request.processes or [])]
+    if not procs:
+        raise HTTPException(status_code=400, detail="No processes provided")
+    return procs
 
 
-# ============================================================================
-# Original MongoDB Routes (kept for compatibility)
-# ============================================================================
+def _config(request, quantum=None, threshold=None, preemptive=False) -> SimConfig:
+    """Build a SimConfig from the shared request options."""
+    try:
+        params = EnergyParams().with_overrides(getattr(request, "params", None))
+        weights = EAHWeights().with_overrides(
+            getattr(request, "eah_weights", None))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    return SimConfig(
+        params=params,
+        eah=weights,
+        governor=getattr(request, "governor", None) or DEFAULT_GOVERNOR,
+        include_timelines=getattr(request, "include_timelines", True),
+        quantum=quantum if quantum is not None else 2,
+        threshold=threshold,
+        preemptive=bool(preemptive),
+    )
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+
+def _simulate(algorithm: str, procs: List[Dict[str, Any]],
+              cfg: SimConfig) -> Dict[str, Any]:
+    """Run one algorithm and attach its energy and advanced metrics."""
+    try:
+        result = run_algorithm(algorithm, procs, cfg)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    energy = summarize_energy(
+        result["gantt"], result["context_switches"],
+        result["frequency_switches"], cfg.params,
+        include_timelines=cfg.include_timelines)
+    energy.update(energy_delay(energy["total_energy"],
+                               result["metrics"]["avg_turnaround"],
+                               len(result["processes"])))
+    energy["governor"] = cfg.governor
+
+    result["energy"] = energy
+    result["advanced_metrics"] = advanced_metrics(result, procs)
+    result.pop("_internal", None)
+    return result
+
+
+def _handle(exc: Exception, where: str):
+    if isinstance(exc, HTTPException):
+        raise exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(status_code=400, detail=str(exc))
+    logger.error("Error in %s: %s", where, exc, exc_info=True)
+    raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Information
+# ---------------------------------------------------------------------------
 
 @api_router.get("/")
 async def root():
-    return {"message": "CPU Scheduler API - Ready"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+    return {"message": "Energy-Aware CPU Scheduler Simulator API - Ready"}
 
 
-# ============================================================================
-# CPU Scheduling API Endpoints (Merged from Flask app.py)
-# ============================================================================
-
-@api_router.get('/health')
+@api_router.get("/health")
 async def health():
-    """Health check endpoint"""
-    return {'status': 'healthy', 'service': 'CPU Scheduler API'}
+    return {"status": "healthy",
+            "service": "Energy-Aware CPU Scheduler Simulator",
+            "database": "connected" if db is not None else "none (not required)"}
 
 
-@api_router.post('/run')
+@api_router.get("/parameters")
+async def parameters():
+    """The energy model and EAH weights, with their defaults."""
+    return {
+        "parameters": EnergyParams().to_api_dict(),
+        "eah_weights": EAHWeights().to_api_dict(),
+        "default_governor": DEFAULT_GOVERNOR,
+        "algorithms": list(COMPARE_ORDER),
+    }
+
+
+@api_router.get("/governors")
+async def governors():
+    return {"governors": list_governors(), "default": DEFAULT_GOVERNOR}
+
+
+@api_router.get("/sweepable")
+async def sweepable_params():
+    return sweepable()
+
+
+# ---------------------------------------------------------------------------
+# Single runs
+# ---------------------------------------------------------------------------
+
+@api_router.post("/run")
 async def run_scheduler(request: SchedulerRequest):
-    """
-    Run selected scheduling algorithm
-    
-    Request Body:
-    {
-        "algorithm": "fcfs" | "sjf" | "sjf_preemptive" | "round_robin" | "priority" | "eah",
-        "processes": [{"pid": 1, "arrival": 0, "burst": 5, "priority": 1}],
-        "quantum": 2 (for Round Robin),
-        "threshold": 5 (for EAH)
-    }
-    """
+    """Run one scheduling algorithm (without the energy block)."""
     try:
-        algorithm = request.algorithm.lower()
-        processes = [p.dict() for p in request.processes]
-        
-        if not processes:
-            raise HTTPException(status_code=400, detail='No processes provided')
-        
-        # Validate process data
-        for p in processes:
-            if 'pid' not in p or 'arrival' not in p or 'burst' not in p:
-                raise HTTPException(status_code=400, detail='Invalid process data. Required: pid, arrival, burst')
-        
-        result = None
-        
-        if algorithm == 'fcfs':
-            result = fcfs(processes)
-        elif algorithm == 'sjf' or algorithm == 'sjf_non_preemptive':
-            result = sjf_non_preemptive(processes)
-        elif algorithm == 'sjf_preemptive' or algorithm == 'srtf':
-            result = sjf_preemptive(processes)
-        elif algorithm == 'round_robin' or algorithm == 'rr':
-            quantum = request.quantum or 2
-            result = round_robin(processes, quantum)
-        elif algorithm == 'priority':
-            preemptive = request.preemptive or False
-            result = priority_scheduling(processes, preemptive)
-        elif algorithm == 'eah' or algorithm == 'energy_aware_hybrid':
-            threshold = request.threshold
-            result = energy_aware_hybrid(processes, threshold)
-        else:
-            raise HTTPException(status_code=400, detail=f'Unknown algorithm: {algorithm}')
-        
+        procs = _processes(request)
+        cfg = _config(request, request.quantum, request.threshold,
+                      request.preemptive)
+        result = run_algorithm(request.algorithm, procs, cfg)
+        result.pop("_internal", None)
         return JSONResponse(content=result)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in run_scheduler: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        _handle(exc, "run_scheduler")
 
 
-@api_router.post('/energy')
-async def calculate_energy(request: EnergyRequest):
-    """
-    Calculate DVFS energy consumption for a given gantt chart
-    
-    Request Body:
-    {
-        "gantt": [{"process": "P1", "start": 0, "end": 5}],
-        "context_switches": 3
-    }
-    """
-    try:
-        gantt = request.gantt
-        context_switches = request.context_switches
-        
-        energy_result = calculate_dvfs_energy(gantt, context_switches)
-        
-        return JSONResponse(content=energy_result)
-    
-    except Exception as e:
-        logger.error(f"Error in calculate_energy: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@api_router.post('/all')
+@api_router.post("/all")
 async def run_all(request: SchedulerRequest):
-    """
-    Run scheduling algorithm and calculate energy in one call
-    
-    Request Body: Same as /run endpoint
+    """Run one algorithm and compute its energy. This is what the UI calls."""
+    try:
+        procs = _processes(request)
+        cfg = _config(request, request.quantum, request.threshold,
+                      request.preemptive)
+        return JSONResponse(content=_simulate(request.algorithm, procs, cfg))
+    except Exception as exc:
+        _handle(exc, "run_all")
+
+
+@api_router.post("/energy")
+async def calculate_energy(request: EnergyRequest):
+    """Energy for a supplied Gantt chart.
+
+    Segments produced by this engine carry their frequency state and are
+    summarised faithfully. Segments without one cannot be DVFS-aware -- there
+    is no way to know what clock the work ran at -- so HIGH is assumed and the
+    response says so, rather than passing a guess off as a measurement.
     """
     try:
-        algorithm = request.algorithm.lower()
-        processes = [p.dict() for p in request.processes]
-        
-        if not processes:
-            raise HTTPException(status_code=400, detail='No processes provided')
-        
-        # Run scheduling algorithm
-        result = None
-        
-        if algorithm == 'fcfs':
-            result = fcfs(processes)
-        elif algorithm == 'sjf' or algorithm == 'sjf_non_preemptive':
-            result = sjf_non_preemptive(processes)
-        elif algorithm == 'sjf_preemptive' or algorithm == 'srtf':
-            result = sjf_preemptive(processes)
-        elif algorithm == 'round_robin' or algorithm == 'rr':
-            quantum = request.quantum or 2
-            result = round_robin(processes, quantum)
-        elif algorithm == 'priority':
-            preemptive = request.preemptive or False
-            result = priority_scheduling(processes, preemptive)
-        elif algorithm == 'eah' or algorithm == 'energy_aware_hybrid':
-            threshold = request.threshold
-            result = energy_aware_hybrid(processes, threshold)
-        else:
-            raise HTTPException(status_code=400, detail=f'Unknown algorithm: {algorithm}')
-        
-        # Calculate energy
-        energy_result = calculate_dvfs_energy(result['gantt'], result['context_switches'])
-        
-        # Combine results
-        result['energy'] = energy_result
-        
-        return JSONResponse(content=result)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in run_all: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        params = EnergyParams().with_overrides(request.params)
+        return JSONResponse(content=calculate_dvfs_energy(
+            request.gantt, request.context_switches, params))
+    except Exception as exc:
+        _handle(exc, "calculate_energy")
 
 
-@api_router.post('/compare')
+@api_router.post("/compare")
 async def compare_algorithms(request: CompareRequest):
-    """
-    Compare all algorithms with the same process set
-    
-    Request Body:
-    {
-        "processes": [{"pid": 1, "arrival": 0, "burst": 5, "priority": 1}],
-        "quantum": 2
-    }
-    """
+    """Run every algorithm on the same workload."""
     try:
-        processes = [p.dict() for p in request.processes]
-        quantum = request.quantum or 2
-        threshold = request.task_threshold
-        
-        if not processes:
-            raise HTTPException(status_code=400, detail='No processes provided')
-        
-        results = {}
-        
-        # Run all algorithms
-        algorithms = [
-            ('fcfs', lambda: fcfs(processes)),
-            ('sjf_non_preemptive', lambda: sjf_non_preemptive(processes)),
-            ('sjf_preemptive', lambda: sjf_preemptive(processes)),
-            ('round_robin', lambda: round_robin(processes, quantum)),
-            ('priority', lambda: priority_scheduling(processes, False)),
-            ('eah', lambda: energy_aware_hybrid(processes, threshold))
-        ]
-        
-        for algo_name, algo_func in algorithms:
+        procs = _processes(request)
+        cfg = _config(request, request.quantum, request.task_threshold)
+        algorithms = list(request.algorithms or COMPARE_ORDER)
+
+        results: Dict[str, Any] = {}
+        points = []
+        for name in algorithms:
             try:
-                result = algo_func()
-                energy = calculate_dvfs_energy(result['gantt'], result['context_switches'])
-                advanced = calculate_advanced_metrics(result, processes)
-                
-                results[algo_name] = {
-                    'algorithm': result['algorithm'],
-                    'avg_turnaround': result['metrics']['avg_turnaround'],
-                    'avg_waiting': result['metrics']['avg_waiting'],
-                    'context_switches': result['context_switches'],
-                    'total_energy': energy['total_energy'],
-                    'completion_time': result['metrics']['total_completion'],
-                    'gantt': result['gantt'],  # Include gantt chart data
-                    'processes': result['processes'],  # Include process details
-                    'advanced_metrics': advanced  # Include advanced metrics
-                }
-            except Exception as e:
-                results[algo_name] = {'error': str(e)}
-        
-        return JSONResponse(content=results)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in compare_algorithms: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+                result = _simulate(name, procs, cfg)
+            except HTTPException as exc:
+                results[name] = {"error": exc.detail}
+                continue
+            except Exception as exc:                      # noqa: BLE001
+                results[name] = {"error": str(exc)}
+                continue
+
+            energy = result["energy"]
+            results[name] = {
+                "algorithm": result["algorithm"],
+                "avg_turnaround": result["metrics"]["avg_turnaround"],
+                "avg_waiting": result["metrics"]["avg_waiting"],
+                "context_switches": result["context_switches"],
+                "frequency_switches": result["frequency_switches"],
+                "total_energy": energy["total_energy"],
+                "completion_time": result["metrics"]["total_completion"],
+                "edp": energy["edp"],
+                "ed2p": energy["ed2p"],
+                "energy_per_process": energy["energy_per_process"],
+                "frequency_residency": energy["frequency_residency"],
+                "energy_breakdown": {
+                    "busy": energy["busy_energy"],
+                    "idle": energy["idle_energy"],
+                    "context_switch": energy["context_switch_energy"],
+                    "frequency_switch": energy["freq_switch_energy"],
+                },
+                "gantt": result["gantt"],
+                "processes": result["processes"],
+                "metrics": result["metrics"],
+                "advanced_metrics": result["advanced_metrics"],
+            }
+            points.append({
+                "key": name,
+                "algorithm": result["algorithm"],
+                "total_energy": energy["total_energy"],
+                "avg_turnaround": result["metrics"]["avg_turnaround"],
+                "avg_waiting": result["metrics"]["avg_waiting"],
+                "total_completion": result["metrics"]["total_completion"],
+                "context_switches": result["context_switches"],
+                "edp": energy["edp"],
+                "ed2p": energy["ed2p"],
+                "energy_per_process": energy["energy_per_process"],
+            })
+
+        # The Pareto analysis travels with the comparison so the UI can show
+        # which policies are genuinely not beaten on both axes, instead of
+        # only naming a single weighted "winner".
+        pareto = pareto_analysis(points, ("total_energy", "avg_turnaround"))
+        radar = normalized_radar(
+            points, ("total_energy", "avg_turnaround", "avg_waiting",
+                     "total_completion", "context_switches"))
+
+        payload = dict(results)
+        payload["_analysis"] = {
+            # The per-point ranks are kept: the comparison table shows which
+            # policy dominates which, not just the frontier membership.
+            "pareto": pareto,
+            "radar": radar,
+            "governor": cfg.governor,
+            "parameters": cfg.params.to_api_dict(),
+        }
+        return JSONResponse(content=payload)
+    except Exception as exc:
+        _handle(exc, "compare_algorithms")
 
 
-@api_router.post('/multicore')
+@api_router.post("/multicore")
 async def run_multicore(request: MulticoreRequest):
-    """
-    Run multi-core CPU scheduling simulation
-    
-    Request Body:
-    {
-        "processes": [{"pid": 1, "arrival": 0, "burst": 5, "priority": 1}],
-        "num_cores": 4,
-        "algorithm": "fcfs",
-        "quantum": 2,
-        "threshold": 5
-    }
+    """Multi-core simulation.
+
+    This path runs at a fixed HIGH clock: DVFS is modelled for the single-core
+    engine only, and pretending otherwise here would be misleading. The
+    response says so explicitly via `dvfs: false`.
     """
     try:
-        processes = [p.dict() for p in request.processes]
-        
-        if not processes:
-            raise HTTPException(status_code=400, detail='No processes provided')
-        
-        if request.num_cores < 2 or request.num_cores > 8:
-            raise HTTPException(status_code=400, detail='Number of cores must be between 2 and 8')
-        
-        algorithm = request.algorithm.lower()
-        
-        # Run multi-core simulation
-        result = multicore_schedule(
-            processes,
-            request.num_cores,
-            algorithm,
-            request.quantum or 2,
-            request.threshold
-        )
-        
-        # Calculate energy for multi-core (sum across all cores)
-        energy = calculate_dvfs_energy(result['gantt'], result['context_switches'])
-        result['energy'] = energy
-        
-        # Calculate advanced metrics
-        advanced = calculate_advanced_metrics(result, processes)
-        result['advanced_metrics'] = advanced
-        
+        procs = _processes(request)
+        result = multicore_schedule(procs, request.num_cores,
+                                    request.algorithm.lower(),
+                                    request.quantum or 2, request.threshold)
+        params = EnergyParams()
+        energy = summarize_energy(result["gantt"], result["context_switches"],
+                                  0, params, include_timelines=True)
+        energy["governor"] = "fixed:high"
+        result["energy"] = energy
+        result["advanced_metrics"] = advanced_metrics(result, procs)
+        result["dvfs"] = False
+        result["governor"] = "fixed:high"
+        result["note"] = ("Multi-core runs at a fixed HIGH clock; DVFS is "
+                          "modelled for single-core scheduling only.")
+        result.pop("_internal", None)
         return JSONResponse(content=result)
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in run_multicore: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        _handle(exc, "run_multicore")
 
 
-# Include the router in the main app
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+
+@api_router.post("/experiment")
+async def experiment(request: ExperimentRequest):
+    """Repeated trials over seeded random workloads.
+
+    Within each trial every algorithm gets the identical workload, so the
+    pairwise differences are far less noisy than the per-algorithm standard
+    deviations. The same seed always gives the same numbers.
+    """
+    try:
+        payload = await run_in_threadpool(
+            monte_carlo,
+            trials=request.trials,
+            seed=request.seed,
+            workload=request.workload,
+            algorithms=request.algorithms,
+            metrics=request.metrics,
+            governor=request.governor or DEFAULT_GOVERNOR,
+            quantum=request.quantum or 2,
+            threshold=request.threshold,
+            params=request.params,
+            eah_weights=request.eah_weights,
+            baseline=request.baseline)
+        return JSONResponse(content=payload)
+    except Exception as exc:
+        _handle(exc, "experiment")
+
+
+@api_router.post("/sweep")
+async def sweep_parameters(request: SweepRequest):
+    """Sweep parameters one axis at a time."""
+    try:
+        procs = ([p.model_dump() for p in request.processes]
+                 if request.processes else None)
+        payload = await run_in_threadpool(
+            run_sweep,
+            sweeps=request.sweeps,
+            processes=procs,
+            workload=request.workload,
+            seed=request.seed,
+            trials_per_point=request.trials_per_point,
+            algorithms=request.algorithms,
+            metrics=request.metrics,
+            governor=request.governor or DEFAULT_GOVERNOR,
+            quantum=request.quantum or 2,
+            threshold=request.threshold,
+            params=request.params,
+            eah_weights=request.eah_weights,
+            include_unaffected=request.include_unaffected)
+        return JSONResponse(content=payload)
+    except Exception as exc:
+        _handle(exc, "sweep_parameters")
+
+
+@api_router.post("/energy_delay")
+async def energy_delay_analysis(request: EnergyDelayRequest):
+    """Energy-delay products and the Pareto frontier."""
+    try:
+        procs = _processes(request)
+        cfg = _config(request, request.quantum, request.threshold)
+        cfg.include_timelines = False
+        algorithms = list(request.algorithms or COMPARE_ORDER)
+
+        points = []
+        for name in algorithms:
+            try:
+                flat = run_once(name, procs, cfg)
+            except Exception as exc:                      # noqa: BLE001
+                points.append({"key": name, "error": str(exc)})
+                continue
+            points.append({
+                "key": name,
+                "algorithm": flat["algorithm"],
+                "total_energy": flat["total_energy"],
+                "avg_turnaround": flat["avg_turnaround"],
+                "avg_waiting": flat["avg_waiting"],
+                "total_completion": flat["total_completion"],
+                "context_switches": flat["context_switches"],
+                "edp": flat["edp"],
+                "ed2p": flat["ed2p"],
+                "energy_per_process": flat["energy_per_process"],
+                "residency": {
+                    "HIGH": flat["residency_high"],
+                    "MED": flat["residency_med"],
+                    "LOW": flat["residency_low"],
+                },
+            })
+
+        analysis = pareto_analysis(points, request.objectives
+                                   or ("total_energy", "avg_turnaround"))
+        analysis["radar"] = normalized_radar(
+            points, ("total_energy", "avg_turnaround", "avg_waiting",
+                     "total_completion", "context_switches"))
+        analysis["governor"] = cfg.governor
+        analysis["parameters"] = cfg.params.to_api_dict()
+        return JSONResponse(content=analysis)
+    except Exception as exc:
+        _handle(exc, "energy_delay_analysis")
+
+
+@api_router.post("/drilldown")
+async def drilldown(request: DrilldownRequest):
+    """Per-process detail, distributions, residency and energy breakdown."""
+    try:
+        procs = _processes(request)
+        cfg = _config(request, request.quantum, request.threshold,
+                      request.preemptive)
+        result = _simulate(request.algorithm, procs, cfg)
+        energy = result["energy"]
+        rows = per_process_detail(result)
+
+        return JSONResponse(content={
+            "algorithm": result["algorithm"],
+            "governor": cfg.governor,
+            "metrics": result["metrics"],
+            "advanced_metrics": result["advanced_metrics"],
+            "per_process": rows,
+            "waiting_distribution": distribution(
+                [r.get("waiting", 0) for r in rows], request.bins),
+            "response_distribution": distribution(
+                [r.get("response_time") or 0 for r in rows], request.bins),
+            "turnaround_distribution": distribution(
+                [r.get("turnaround", 0) for r in rows], request.bins),
+            "starvation": starvation_report(result, cfg.params),
+            "frequency_residency": {
+                "by_busy_time": energy["frequency_residency"],
+                "by_work": energy["residency_by_work"],
+                "by_wall_time": energy["residency_by_wall_time"],
+                "switches": energy["frequency_switches"],
+            },
+            "energy_breakdown": {
+                "busy": energy["busy_energy"],
+                "idle": energy["idle_energy"],
+                "context_switch": energy["context_switch_energy"],
+                "frequency_switch": energy["freq_switch_energy"],
+                "total": energy["total_energy"],
+                "by_state": energy["energy_by_state"],
+            },
+            "gantt": result["gantt"],
+            "parameters": cfg.params.to_api_dict(),
+        })
+    except Exception as exc:
+        _handle(exc, "drilldown")
+
+
+# ---------------------------------------------------------------------------
+# Wiring
+# ---------------------------------------------------------------------------
+
 app.include_router(api_router)
 
-# Mount static files for frontend
+# The static mount must come last: a mount at "/" swallows everything that did
+# not match a route registered above it.
 frontend_path = Path(__file__).parent.parent / "frontend" / "public"
 if frontend_path.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")
+    app.mount("/", StaticFiles(directory=str(frontend_path), html=True),
+              name="static")
 
-# CORS Configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],  # Allow all origins for academic project
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
-
-# Log startup
 @app.on_event("startup")
 async def startup_event():
-    logger.info("CPU Scheduling Simulator API started successfully")
-    logger.info("Available endpoints: /api/health, /api/run, /api/energy, /api/all, /api/compare")
+    logger.info("Energy-Aware CPU Scheduler Simulator API started")
+    if db is None:
+        logger.info("No database configured (MONGO_URL unset) - not required")
+    if frontend_path.exists():
+        logger.info("Serving the UI from %s", frontend_path)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if client is not None:
+        client.close()

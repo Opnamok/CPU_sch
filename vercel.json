@@ -1,27 +1,12 @@
 {
   "version": 2,
-  "buildCommand": "cd frontend && yarn install && yarn build",
-  "outputDirectory": "frontend/build",
-  "routes": [
+  "outputDirectory": "frontend/public",
+  "rewrites": [
     {
-      "src": "/scheduler-index.html",
-      "dest": "/scheduler-index.html"
-    },
-    {
-      "src": "/css/(.*)",
-      "dest": "/css/$1"
-    },
-    {
-      "src": "/js/(.*)",
-      "dest": "/js/$1"
-    },
-    {
-      "src": "/static/(.*)",
-      "dest": "/static/$1"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/index.html"
+      "source": "/",
+      "destination": "/scheduler-index.html"
     }
-  ]
+  ],
+  "cleanUrls": false,
+  "trailingSlash": false
 }
